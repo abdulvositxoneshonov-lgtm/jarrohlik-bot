@@ -816,11 +816,15 @@ async def show_my_bookings_list(update: Update, context: ContextTypes.DEFAULT_TY
             if db_user else []
         )
 
-    if not bookings:
-        await query.edit_message_text(t("my_bookings_empty", lang))
-        return
+        if not bookings:
+            await query.edit_message_text(t("my_bookings_empty", lang))
+            return
 
-    await query.edit_message_text(t("my_bookings_title", lang), reply_markup=build_my_bookings_keyboard(bookings, lang), parse_mode="HTML")
+        # Klaviatura shu yerda, app_context ICHIDA yasalishi shart — aks holda
+        # b.service kabi lazy-load munosabatlar sessiyadan uzilib, DetachedInstanceError beradi
+        keyboard = build_my_bookings_keyboard(bookings, lang)
+
+    await query.edit_message_text(t("my_bookings_title", lang), reply_markup=keyboard, parse_mode="HTML")
 
 
 async def show_my_booking_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
