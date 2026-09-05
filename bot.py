@@ -1106,7 +1106,7 @@ async def run_bot():
     application_instance = application
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start, filters=filters.ChatType.PRIVATE)],
         states={
             LANG: [CallbackQueryHandler(select_language, pattern="^lang_")],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
@@ -1115,13 +1115,16 @@ async def run_bot():
             MENU: [CallbackQueryHandler(select_service, pattern="^svc_")],
             CONFIRM: [CallbackQueryHandler(confirm_booking, pattern="^(confirm|back)$")],
         },
-        fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
+            CommandHandler("cancel", cancel, filters=filters.ChatType.PRIVATE),
+        ],
         allow_reentry=True,
     )
 
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("faq", faq_command))
+    application.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
+    application.add_handler(CommandHandler("faq", faq_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(faq_view_answer, pattern="^faqview_"))
     application.add_handler(CallbackQueryHandler(admin_approve, pattern="^approve_"))
     application.add_handler(CallbackQueryHandler(admin_reject, pattern="^reject_"))
@@ -1134,8 +1137,11 @@ async def run_bot():
     application.add_handler(CallbackQueryHandler(confirm_my_booking_cancel, pattern="^myb_cancel_"))
     # Biz haqimizda
     application.add_handler(CallbackQueryHandler(show_about_clinic, pattern="^about_clinic$"))
-    # Erkin matnli savollarga avtomatik javob — faqat conversation FAOL BO'LMAGANDA ishlaydi
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, answer_question))
+    # Erkin matnli savollarga avtomatik javob — faqat shaxsiy chatda (guruh/kanalda emas) va
+    # conversation FAOL BO'LMAGANDA ishlaydi
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, answer_question)
+    )
 
     logger.info("Bot handlerlari ro'yxatdan o'tkazildi")
 
