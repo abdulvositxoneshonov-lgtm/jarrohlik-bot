@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FAQ - Jarrohlik Markazi</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f5f7fb; }
+        .faq-card { border: none; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark" style="background: linear-gradient(135deg, #4e54c8, #8f94fb);">
+        <div class="container">
+            <span class="navbar-brand">🏥 Jarrohlik Markazi — Admin</span>
+            <div class="d-flex">
+                <a href="/" class="btn btn-outline-light btn-sm me-2">Dashboard</a>
+                <a href="/bookings" class="btn btn-outline-light btn-sm me-2">Bookings</a>
+                <a href="/services" class="btn btn-outline-light btn-sm me-2">Services</a>
+                <a href="/faq" class="btn btn-light btn-sm">FAQ</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-4">
+        <h2 class="mb-4">❓ Ko'p So'raladigan Savollar</h2>
+
+        <div class="card shadow-sm border-0 mb-4">
+            <div class="card-body">
+                <h5 class="card-title mb-3">Yangi FAQ Qo'shish</h5>
+                <form id="add-faq-form">
+                    <div class="mb-3">
+                        <label class="form-label">Savol *</label>
+                        <input type="text" class="form-control" id="question" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Javob *</label>
+                        <textarea class="form-control" id="answer" rows="3" required></textarea>
+                    </div>
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-6">
+                            <label class="form-label">Kategoriya *</label>
+                            <input type="text" class="form-control" id="category" list="category-options"
+                                   placeholder="masalan: Qabul vaqtlari" required>
+                            <datalist id="category-options"></datalist>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Muallif</label>
+                            <input type="text" class="form-control" id="created_by" value="admin">
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Qo'shish</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="btn-group flex-wrap mb-3" role="group" id="filter-buttons">
+            <button class="btn btn-primary btn-sm active" onclick="filterFaqs('', this)">Hammasi</button>
+        </div>
+
+        <div class="card faq-card">
+            <div class="list-group list-group-flush" id="faqs-list">
+                <div class="text-center text-muted py-4">Yuklanmoqda...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentFilter = '';
+        let knownCategories = [];
+
+        function updateCategoryHelpers(faqs) {
+            const categories = [...new Set(faqs.map(f => f.category).filter(Boolean))].sort();
+            if (JSON.stringify(categories) === JSON.stringify(knownCategories)) return;
+            knownCategories = categories;
+
+            const datalist = document.getElementById('category-options');
+            datalist.innerHTML = categories.map(c => `<option value="${c}"></option>`).join('');
+
+            const filterContainer = document.getElementById('filter-buttons');
+            const allBtn = filterContainer.querySelector('button');
+            filterContainer.innerHTML = '';
+            filterContainer.appendChild(allBtn);
+            categories.forEach(category => {
+                const btn = document.createElement('button');
+                btn.className = 'btn btn-outline-primary btn-sm';
+                btn.textContent = category;
+                btn.onclick = () => filterFaqs(category, btn);
+                filterContainer.appendChild(btn);
+            });
+        }
+
+        async function loadFaqs(category = '') {
+            try {
+                const url = category ? `/api/faq?category=${encodeURIComponent(category)}` : '/api/faq';
+                const response = await fetch(url);
+                const data = await response.json();
+                const list = document.getElementById('faqs-list');
+
+                if (!category) {
+                    const allResponse = await fetch('/api/faq');
+                    const allData = await allResponse.json();
+                    updateCategoryHelpers(allData.data || []);
+                }
+
+                if (!data.data || data.data.length === 0) {
+                    list.innerHTML = '<div class="text-center text-muted py-4">FAQ topilmadi</div>';
+                    return;
+                }
+
+                list.innerHTML = data.data.map(faq => `
+                    <div class="list-group-item p-3">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div>
+                                <div class="fw-bold">${faq.question}</div>
+                                <span class="badge bg-light text-dark border">${faq.category}</span>
+                            </div>
+                        </div>
+                        <p class="text-muted mt-2 mb-1">${faq.answer}</p>
+                        <div class="text-muted small">👤 ${faq.created_by || 'admin'} · 📅 ${new Date(faq.created_at).toLocaleDateString('uz-UZ')}</div>
+                        <div class="mt-2">
+                            <button class="btn btn-sm btn-outline-primary" onclick="editFaq(${faq.id})">Tahrirlash</button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteFaq(${faq.id})">O'chirish</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading FAQs:', error);
+            }
+        }
+
+        function filterFaqs(category, btn) {
+            currentFilter = category;
+            document.querySelectorAll('#filter-buttons button').forEach(b => {
+                b.classList.remove('btn-primary', 'active');
+                b.classList.add('btn-outline-primary');
+            });
+            btn.classList.remove('btn-outline-primary');
+            btn.classList.add('btn-primary', 'active');
+            loadFaqs(category);
+        }
+
+        document.getElementById('add-faq-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+                const response = await fetch('/api/faq', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        question: document.getElementById('question').value,
+                        answer: document.getElementById('answer').value,
+                        category: document.getElementById('category').value,
+                        created_by: document.getElementById('created_by').value,
+                    })
+                });
+                if (response.ok) {
+                    e.target.reset();
+                    loadFaqs(currentFilter);
+                }
+            } catch (error) {
+                console.error('Error adding FAQ:', error);
+            }
+        });
+
+        async function deleteFaq(id) {
+            if (confirm("Ishonchingiz komilmi?")) {
+                try {
+                    const response = await fetch(`/api/faq/${id}`, { method: 'DELETE' });
+                    if (response.ok) loadFaqs(currentFilter);
+                } catch (error) {
+                    console.error('Error deleting FAQ:', error);
+                }
+            }
+        }
+
+        async function editFaq(id) {
+            alert("Tahrirlash funktsiyasi qo'shimcha takomillashtirilmoqda");
+        }
+
+        loadFaqs();
+        setInterval(() => loadFaqs(currentFilter), 30000);
+    </script>
+</body>
+</html>

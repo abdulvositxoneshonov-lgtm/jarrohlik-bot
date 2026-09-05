@@ -1,0 +1,16 @@
+[Unit]
+Description=Jarrohlik Markazi - Admin boti (admin_bot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/jarrohlik-bot
+EnvironmentFile=/home/opc/jarrohlik-bot/.env
+ExecStart=/home/opc/jarrohlik-bot/venv/bin/python3 /home/opc/jarrohlik-bot/admin_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

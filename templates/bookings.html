@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bookings - Jarrohlik Markazi</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f5f7fb; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark" style="background: linear-gradient(135deg, #4e54c8, #8f94fb);">
+        <div class="container">
+            <span class="navbar-brand">🏥 Jarrohlik Markazi — Admin</span>
+            <div class="d-flex">
+                <a href="/" class="btn btn-outline-light btn-sm me-2">Dashboard</a>
+                <a href="/bookings" class="btn btn-light btn-sm me-2">Bookings</a>
+                <a href="/services" class="btn btn-outline-light btn-sm me-2">Services</a>
+                <a href="/faq" class="btn btn-outline-light btn-sm">FAQ</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container py-4">
+        <h2 class="mb-4">📋 Band qilishlar</h2>
+
+        <div class="card shadow-sm border-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ID</th>
+                            <th>Foydalanuvchi</th>
+                            <th>Xizmat</th>
+                            <th>Shifokor</th>
+                            <th>Status</th>
+                            <th>Sana</th>
+                            <th>Harakatlar</th>
+                        </tr>
+                    </thead>
+                    <tbody id="bookings-body">
+                        <tr><td colspan="7" class="text-center text-muted py-4">Yuklanmoqda...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const statusBadge = {
+            pending: 'bg-warning text-dark',
+            confirmed: 'bg-success',
+            cancelled: 'bg-danger',
+            completed: 'bg-info text-dark',
+        };
+
+        async function loadBookings() {
+            try {
+                const response = await fetch('/api/bookings');
+                const data = await response.json();
+                const tbody = document.getElementById('bookings-body');
+
+                if (!data.data || data.data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">Band qilishlar topilmadi</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = data.data.map(booking => `
+                    <tr>
+                        <td>${booking.id}</td>
+                        <td>${booking.user ? (booking.user.full_name || booking.user.username || booking.user.first_name || 'N/A') : 'N/A'}</td>
+                        <td>${booking.service ? booking.service.name : 'N/A'}</td>
+                        <td>${booking.doctor_name || '-'}</td>
+                        <td><span class="badge ${statusBadge[booking.status] || 'bg-secondary'}">${booking.status}</span></td>
+                        <td>${new Date(booking.created_at).toLocaleDateString('uz-UZ')}</td>
+                        <td>
+                            <button class="btn btn-sm btn-success" onclick="updateStatus(${booking.id}, 'confirmed')">Tasdiqlash</button>
+                            <button class="btn btn-sm btn-danger" onclick="updateStatus(${booking.id}, 'cancelled')">Bekor qilish</button>
+                            <button class="btn btn-sm btn-secondary" onclick="deleteBooking(${booking.id})">O'chirish</button>
+                        </td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading bookings:', error);
+            }
+        }
+
+        async function updateStatus(id, status) {
+            try {
+                const response = await fetch(`/api/bookings/${id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status })
+                });
+                if (response.ok) loadBookings();
+            } catch (error) {
+                console.error('Error updating booking:', error);
+            }
+        }
+
+        async function deleteBooking(id) {
+            if (confirm("Ishonchingiz komilmi?")) {
+                try {
+                    const response = await fetch(`/api/bookings/${id}`, { method: 'DELETE' });
+                    if (response.ok) loadBookings();
+                } catch (error) {
+                    console.error('Error deleting booking:', error);
+                }
+            }
+        }
+
+        loadBookings();
+        setInterval(loadBookings, 30000);
+    </script>
+</body>
+</html>
