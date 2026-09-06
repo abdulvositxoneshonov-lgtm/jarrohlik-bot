@@ -112,6 +112,9 @@ class Booking(db.Model):
     # o'zgartirilganda ham, aynan shu kartochkani (guruhdagi) real vaqtda yangilash uchun ishlatiladi
     group_chat_id: Mapped[int] = mapped_column(Integer, nullable=True)
     group_message_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    # Booking uzoq vaqt "Kutilmoqda" holatida javobsiz qolib ketsa, operatorlarga bitta marta
+    # ogohlantirish eslatmasi yuborilganini belgilaydi (takror spam bo'lmasligi uchun)
+    followup_reminder_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Relationships
     user = relationship("User", back_populates="bookings")

@@ -1451,6 +1451,24 @@ async def reminder_and_review_worker():
                 for b in due_review:
                     b.review_requested = True
 
+                # --- 30 daqiqadan beri "Kutilmoqda" holatida javobsiz qolib ketgan bookinglar ---
+                # Operatorlarga (guruhga) ESLATIB QO'YISH uchun — Telegramda eski xabarni tahrirlash
+                # hech kimga bildirishnoma yubormaydi, shuning uchun bu ataylab YANGI xabar sifatida
+                # yuboriladi. Har bir booking uchun FAQAT BIR MARTA (followup_reminder_sent orqali
+                # nazorat qilinadi — spam bo'lmasligi uchun).
+                stale_cutoff = now - timedelta(minutes=30)
+                due_followup = Booking.query.filter(
+                    Booking.status == BookingStatus.PENDING,
+                    Booking.created_at <= stale_cutoff,
+                    Booking.followup_reminder_sent.is_(False),
+                ).all()
+                followups = [
+                    (b.id, b.group_message_id, build_admin_card_text(b), build_admin_card_keyboard(b))
+                    for b in due_followup
+                ]
+                for b in due_followup:
+                    b.followup_reminder_sent = True
+
                 db.session.commit()
 
             for booking_id, tg_id, lang, service_name, appt in reminders_24h:
@@ -1486,6 +1504,24 @@ async def reminder_and_review_worker():
                     )
                 except Exception as e:
                     logger.warning(f"Sharh so'rovi yuborilmadi (booking {booking_id}): {e}")
+
+            for booking_id, g_msg_id, card_text, card_keyboard in followups:
+                try:
+                    reminder_text = (
+                        "⚠️ <b>Diqqat! Bu so'rov 30 daqiqadan beri javobsiz turibdi</b>\n"
+                        + SEP + "\n" + card_text
+                    )
+                    send_kwargs = dict(
+                        chat_id=CHANNEL_ID, text=reminder_text, parse_mode="HTML",
+                        reply_markup=card_keyboard,
+                    )
+                    # Iloji bo'lsa, asl kartochkaga JAVOB tariqasida yuboramiz — shunda operatorlar
+                    # qaysi bookingga tegishli ekanini darhol, chatni aylantirmasdan ko'radi
+                    if g_msg_id:
+                        send_kwargs["reply_to_message_id"] = g_msg_id
+                    await application_instance.bot.send_message(**send_kwargs)
+                except Exception as e:
+                    logger.warning(f"Javobsiz booking uchun eslatma yuborilmadi (booking {booking_id}): {e}")
 
         except Exception as e:
             logger.error(f"Eslatma/sharh worker xatosi: {e}")
