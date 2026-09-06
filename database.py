@@ -2,7 +2,7 @@ from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from enum import Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, Float, DateTime, Text, Enum as SQLEnum, ForeignKey, Index
+from sqlalchemy import String, Integer, Float, DateTime, Text, Enum as SQLEnum, ForeignKey, Index, Boolean
 
 db = SQLAlchemy()
 
@@ -28,6 +28,8 @@ class User(db.Model):
     language: Mapped[str] = mapped_column(String(5), nullable=True)  # 'lt' yoki 'kr'
     profile_pic_url: Mapped[str] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    referral_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=True)  # Bu foydalanuvchining o'ziga xos taklif kodi
+    referred_by_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)  # Kimning taklifi bilan kelgan (users.id)
 
     # Relationships
     bookings = relationship("Booking", back_populates="user", cascade="all, delete-orphan")
@@ -101,6 +103,11 @@ class Booking(db.Model):
         nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    appointment_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)  # Admin belgilagan qabul sanasi/vaqti
+    reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # 24 soat oldin eslatma yuborilganmi
+    reminder_1h_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)   # 1 soat oldin eslatma yuborilganmi
+    rating: Mapped[int] = mapped_column(Integer, nullable=True)  # Mijoz qoldirgan baho (1-5)
+    review_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # Sharh so'rovi yuborilganmi
 
     # Relationships
     user = relationship("User", back_populates="bookings")

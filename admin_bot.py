@@ -12,7 +12,9 @@ import os
 import asyncio
 import io
 import uuid
-from datetime import datetime
+import html
+from collections import Counter
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -47,7 +49,8 @@ logger = logging.getLogger(__name__)
 (
     ADMIN_MENU, SVC_NAME, SVC_DESC, SVC_DURATION, SVC_PRICE, SVC_EDIT_VALUE, FAQ_Q, FAQ_A, FAQ_CAT,
     CLINIC_EDIT_VALUE, CLINIC_LOCATION, BROADCAST_HEADLINE, BROADCAST_TEXT, BROADCAST_IMAGE,
-) = range(14)
+    APPOINTMENT_DATE,
+) = range(15)
 
 # Rasm biriktirilgan ommaviy xabarlar shu papkaga saqlanadi — bot.py xuddi shu papkadan o'qib qayta yuklaydi
 # (Telegram file_id turli botlar orasida ishlamaydi, shuning uchun rasm fayl sifatida saqlanadi)
@@ -267,9 +270,13 @@ async def show_booking_detail(query, context: ContextTypes.DEFAULT_TYPE, booking
             f"🏥 <b>Xizmat:</b> {b.service.name if b.service else '—'}\n"
             f"⏱ <b>Davomiyligi:</b> {b.service.duration_minutes if b.service else '—'} daqiqa\n"
             f"💰 <b>Narxi:</b> {b.service.price:,.0f} so'm\n\n"
-            f"📅 <b>Sana:</b> {b.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"📅 <b>Yaratilgan:</b> {b.created_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"🆔 <b>Foydalanuvchi ID:</b> {b.user.telegram_id}"
         )
+        if b.appointment_at:
+            text += f"\n🗓 <b>Qabul vaqti:</b> {b.appointment_at.strftime('%d.%m.%Y %H:%M')}"
+        if b.rating:
+            text += f"\n⭐ <b>Mijoz bahosi:</b> {'⭐' * b.rating} ({b.rating}/5)"
 
     status_row = []
     if current_status != BookingStatus.CONFIRMED:
@@ -282,6 +289,10 @@ async def show_booking_detail(query, context: ContextTypes.DEFAULT_TYPE, booking
         keyboard.append(status_row)
     if current_status != BookingStatus.COMPLETED:
         keyboard.append([InlineKeyboardButton("✔️ Bajarildi deb belgilash", callback_data=f"bk_status_completed_{b.id}")])
+    # Faqat tasdiqlangan bookinglar uchun qabul sanasini belgilash mumkin — shundagina
+    # bot.py'dagi eslatma workeri 24 soat/1 soat oldin avtomatik eslatma yubora oladi
+    if current_status == BookingStatus.CONFIRMED:
+        keyboard.append([InlineKeyboardButton("📅 Qabul sanasini belgilash", callback_data=f"bk_setdate_{b.id}")])
     keyboard.append([InlineKeyboardButton("🗑 O'chirish", callback_data=f"bk_delete_{b.id}")])
     keyboard.append([InlineKeyboardButton("⬅️ Ro'yxatga qaytish", callback_data="bk_backlist")])
 
@@ -301,6 +312,62 @@ async def change_booking_status(query, context: ContextTypes.DEFAULT_TYPE, new_s
 
     await query.answer("✅ Status yangilandi!", show_alert=False)
     return await show_booking_detail(query, context, booking_id)
+
+
+async def ask_appointment_date(query, context: ContextTypes.DEFAULT_TYPE, booking_id: int) -> int:
+    """'📅 Qabul sanasini belgilash' tugmasi bosilganda — sanani matn shaklida so'raydi."""
+    context.user_data["setdate_booking_id"] = booking_id
+    keyboard = [[InlineKeyboardButton("⬅️ Bekor qilish", callback_data=f"bk_view_{booking_id}")]]
+    await query.edit_message_text(
+        "📅 Qabul sanasi va vaqtini kiriting.\n\n"
+        "Format: <code>KK.OO.YYYY SS:DD</code>\n"
+        "Masalan: <code>25.12.2026 14:30</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return APPOINTMENT_DATE
+
+
+async def appointment_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin kiritgan sanani parse qilib bookingga yozadi — bot.py'dagi eslatma workeri shundan foydalanadi."""
+    booking_id = context.user_data.get("setdate_booking_id")
+    text = (update.message.text or "").strip()
+
+    if not booking_id:
+        await update.message.reply_text("Xatolik: qaysi booking ekanligi aniqlanmadi. Qaytadan urinib ko'ring.")
+        return ADMIN_MENU
+
+    try:
+        appointment_at = datetime.strptime(text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        keyboard = [[InlineKeyboardButton("⬅️ Bekor qilish", callback_data=f"bk_view_{booking_id}")]]
+        await update.message.reply_text(
+            "Format noto'g'ri. Iltimos, aynan shu ko'rinishda yozing:\n"
+            "<code>25.12.2026 14:30</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return APPOINTMENT_DATE
+
+    with flask_app.app_context():
+        b = Booking.query.get(booking_id)
+        if not b:
+            await update.message.reply_text("Booking topilmadi.")
+            return ADMIN_MENU
+        b.appointment_at = appointment_at
+        # Sana qayta belgilansa (masalan ko'chirilsa) — eslatmalar yangi vaqt bo'yicha QAYTA yuborilishi uchun tiklaymiz
+        b.reminder_24h_sent = False
+        b.reminder_1h_sent = False
+        db.session.commit()
+
+    keyboard = [[InlineKeyboardButton("⬅️ Bookingga qaytish", callback_data=f"bk_view_{booking_id}")]]
+    await update.message.reply_text(
+        f"✅ Qabul sanasi belgilandi: <b>{appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        "Mijozga 24 soat va 1 soat qolganda avtomatik eslatma yuboriladi.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ADMIN_MENU
 
 
 async def confirm_booking_delete(query, context: ContextTypes.DEFAULT_TYPE, booking_id: int) -> int:
@@ -691,18 +758,65 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     if data == "adm_stats":
         with flask_app.app_context():
-            text = (
-                "📊 Statistika\n\n"
-                f"👥 Foydalanuvchilar: {User.query.count()}\n"
-                f"📅 Jami bookinglar: {Booking.query.count()}\n"
-                f"🟡 Kutilayotgan: {Booking.query.filter_by(status=BookingStatus.PENDING).count()}\n"
-                f"🟢 Tasdiqlangan: {Booking.query.filter_by(status=BookingStatus.CONFIRMED).count()}\n"
-                f"🔴 Bekor qilingan: {Booking.query.filter_by(status=BookingStatus.CANCELLED).count()}\n"
-                f"🏥 Xizmatlar: {Service.query.count()}\n"
-                f"❓ FAQ: {FAQ.query.count()}"
-            )
+            total_users = User.query.count()
+            referred_total = User.query.filter(User.referred_by_id.isnot(None)).count()
+
+            total_bookings = Booking.query.count()
+            week_ago = datetime.utcnow() - timedelta(days=7)
+            week_bookings = Booking.query.filter(Booking.created_at >= week_ago).count()
+
+            pending_c = Booking.query.filter_by(status=BookingStatus.PENDING).count()
+            confirmed_c = Booking.query.filter_by(status=BookingStatus.CONFIRMED).count()
+            cancelled_c = Booking.query.filter_by(status=BookingStatus.CANCELLED).count()
+            completed_c = Booking.query.filter_by(status=BookingStatus.COMPLETED).count()
+
+            # Taxminiy daromad — tasdiqlangan va bajarilgan bookinglar narxlari yig'indisi
+            revenue_bookings = Booking.query.filter(
+                Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.COMPLETED])
+            ).all()
+            revenue = sum((b.service.price if b.service else 0) for b in revenue_bookings)
+
+            # O'rtacha mijoz bahosi (sharh so'rovi orqali yig'ilgan)
+            rated = Booking.query.filter(Booking.rating.isnot(None)).all()
+            avg_rating = (sum(b.rating for b in rated) / len(rated)) if rated else None
+
+            # Eng faol taklif qiluvchi (referral tizimi orqali eng ko'p do'st jalb qilgan mijoz)
+            referred_users = User.query.filter(User.referred_by_id.isnot(None)).all()
+            top_referrer_line = ""
+            if referred_users:
+                counts = Counter(u.referred_by_id for u in referred_users)
+                top_id, top_count = counts.most_common(1)[0]
+                top_user = User.query.get(top_id)
+                top_name = html.escape(top_user.full_name or top_user.first_name or "?") if top_user else "?"
+                top_referrer_line = f"\n🏆 Eng faol taklif qiluvchi: <b>{top_name}</b> ({top_count} ta do'st)"
+
+            services_count = Service.query.count()
+            faq_count = FAQ.query.count()
+
+        rating_line = (
+            f"⭐ O'rtacha baho: <b>{avg_rating:.1f}/5</b> ({len(rated)} ta sharh)"
+            if avg_rating is not None else "⭐ Hali sharhlar yo'q"
+        )
+
+        text = (
+            "📊 <b>Statistik Dashboard</b>\n"
+            "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n"
+            f"👥 Foydalanuvchilar: <b>{total_users}</b>\n"
+            f"🎁 Referral orqali kelganlar: <b>{referred_total}</b>"
+            f"{top_referrer_line}\n\n"
+            f"📅 Jami bookinglar: <b>{total_bookings}</b>\n"
+            f"🆕 So'nggi 7 kunda: <b>{week_bookings}</b>\n\n"
+            f"🟡 Kutilayotgan: {pending_c}\n"
+            f"🟢 Tasdiqlangan: {confirmed_c}\n"
+            f"🔴 Bekor qilingan: {cancelled_c}\n"
+            f"✅ Bajarilgan: {completed_c}\n\n"
+            f"💰 Taxminiy daromad: <b>{revenue:,.0f} so'm</b>\n"
+            f"{rating_line}\n\n"
+            f"🏥 Xizmatlar: {services_count}\n"
+            f"❓ FAQ: {faq_count}"
+        )
         keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return ADMIN_MENU
 
     if data == "adm_bookings":
@@ -725,6 +839,10 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         rest = data[len("bk_status_"):]
         status_str, booking_id_str = rest.rsplit("_", 1)
         return await change_booking_status(query, context, status_str, int(booking_id_str))
+
+    if data.startswith("bk_setdate_"):
+        booking_id = int(data.rsplit("_", 1)[1])
+        return await ask_appointment_date(query, context, booking_id)
 
     if data.startswith("bk_delconfirm_"):
         booking_id = int(data.rsplit("_", 1)[1])
@@ -1001,6 +1119,10 @@ async def run_bot():
             CLINIC_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, clinic_edit_value)],
             CLINIC_LOCATION: [
                 MessageHandler((filters.TEXT | filters.LOCATION) & ~filters.COMMAND, clinic_location),
+                CallbackQueryHandler(admin_router),  # "Bekor qilish" tugmasi shu yerdan ham bosilishi mumkin
+            ],
+            APPOINTMENT_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, appointment_date_received),
                 CallbackQueryHandler(admin_router),  # "Bekor qilish" tugmasi shu yerdan ham bosilishi mumkin
             ],
             BROADCAST_HEADLINE: [

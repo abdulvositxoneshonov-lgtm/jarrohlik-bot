@@ -3,7 +3,8 @@ import os
 import re
 import asyncio
 import difflib
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -219,6 +220,31 @@ TEXTS = {
         "lt": "Hali to'ldirilmagan",
         "kr": "Ҳали тўлдирилмаган",
     },
+    "reminder_24h": {
+        "lt": "⏰ <b>Eslatma!</b>\n" + SEP + "\nErtaga (24 soatdan keyin) sizda <b>{service}</b> bo'yicha qabul bor.\n📅 Vaqti: <b>{date}</b>\n\nIltimos, vaqtida keling! 🙏",
+        "kr": "⏰ <b>Эслатма!</b>\n" + SEP + "\nЭртага (24 соатдан кейин) сизда <b>{service}</b> бўйича қабул бор.\n📅 Вақти: <b>{date}</b>\n\nИлтимос, вақтида келинг! 🙏",
+    },
+    "reminder_1h": {
+        "lt": "⏰ <b>Diqqat! 1 soatdan keyin qabulingiz boshlanadi</b>\n" + SEP + "\n🏥 Xizmat: <b>{service}</b>\n🕒 Vaqti: <b>{date}</b>\n\nKlinikaga yetib borishni unutmang! 🙏",
+        "kr": "⏰ <b>Диққат! 1 соатдан кейин қабулингиз бошланади</b>\n" + SEP + "\n🏥 Хизмат: <b>{service}</b>\n🕒 Вақти: <b>{date}</b>\n\nКлиникага етиб боришни унутманг! 🙏",
+    },
+    "review_request": {
+        "lt": "🙏 <b>Qabulimizdan qanday taassurot oldingiz?</b>\n" + SEP + "\n🏥 Xizmat: <b>{service}</b>\n\nXizmatimizni 1 dan 5 gacha baholang — bu bizga yaxshilanishga yordam beradi:",
+        "kr": "🙏 <b>Қабулимиздан қандай таассурот олдингиз?</b>\n" + SEP + "\n🏥 Хизмат: <b>{service}</b>\n\nХизматимизни 1 дан 5 гача баҳоланг — бу бизга яхшиланишга ёрдам беради:",
+    },
+    "review_thanks": {
+        "lt": "✅ Rahmat! Sizning bahoyingiz: {stars}\n\nFikringiz biz uchun juda muhim. 🙏",
+        "kr": "✅ Раҳмат! Сизнинг баҳойингиз: {stars}\n\nФикрингиз биз учун жуда муҳим. 🙏",
+    },
+    "referral_btn": {"lt": "🎁 Do'stni taklif qilish", "kr": "🎁 Дўстни таклиф қилиш"},
+    "referral_info": {
+        "lt": "🎁 <b>Do'stni taklif qiling!</b>\n" + SEP + "\nUshbu havolani do'stlaringizga yuboring — ular botga shu havola orqali kirsa, taklifingiz hisobga olinadi:\n\n<code>{link}</code>\n\n👥 Siz orqali kelganlar: <b>{count}</b> kishi",
+        "kr": "🎁 <b>Дўстни таклиф қилинг!</b>\n" + SEP + "\nУшбу ҳаволани дўстларингизга юборинг — улар ботга шу ҳавола орқали кирса, таклифингиз ҳисобга олинади:\n\n<code>{link}</code>\n\n👥 Сиз орқали келганлар: <b>{count}</b> киши",
+    },
+    "referral_notify_inviter": {
+        "lt": "🎉 Ajoyib xabar! Siz taklif qilgan <b>{name}</b> botdan ro'yxatdan o'tdi. Rahmat, do'stlaringizni taklif qilishda davom eting! 🙏",
+        "kr": "🎉 Ажойиб хабар! Сиз таклиф қилган <b>{name}</b> ботдан рўйхатдан ўтди. Раҳмат, дўстларингизни таклиф қилишда давом этинг! 🙏",
+    },
 }
 
 
@@ -242,6 +268,16 @@ def user_mention_html(tg_user, label: str = None) -> str:
     """Foydalanuvchi profiliga bosiladigan HTML havola — username bo'lmasa ham ID orqali ochiladi."""
     name = esc(label or tg_user.first_name or "Foydalanuvchi")
     return f'<a href="tg://user?id={tg_user.id}">{name}</a>'
+
+
+def generate_unique_referral_code() -> str:
+    """Har bir foydalanuvchi uchun bir martalik, takrorlanmas taklif kodi yasaydi.
+    FAQAT flask_app.app_context() ICHIDA chaqirilishi kerak — chunki bazadan tekshiradi."""
+    for _ in range(5):
+        code = uuid.uuid4().hex[:8]
+        if not User.query.filter_by(referral_code=code).first():
+            return code
+    return uuid.uuid4().hex[:12]  # juda kam ehtimollik, lekin ehtiyot chorasi
 
 
 # ==================== FAQ QIDIRUV (LOTIN/KIRILL MOSLASHTIRISH) ====================
@@ -369,6 +405,7 @@ def build_services_keyboard(lang: str, services) -> InlineKeyboardMarkup:
         InlineKeyboardButton(t("my_bookings_btn", lang), callback_data="mybookings_list"),
         InlineKeyboardButton(t("about_btn", lang), callback_data="about_clinic"),
     ])
+    keyboard.append([InlineKeyboardButton(t("referral_btn", lang), callback_data="referral_info")])
     keyboard.append([InlineKeyboardButton(t("cancel_btn", lang), callback_data="svc_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -438,7 +475,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return await send_subscription_prompt(update, context)
 
         if not db_user:
-            db_user = User(telegram_id=tg_user.id, username=tg_user.username, first_name=tg_user.first_name)
+            # Referral: agar /start ...?start=ref_<kod> havolasi orqali kirgan bo'lsa, taklif qilgan
+            # foydalanuvchini topamiz. Bu tekshiruv FAQAT yangi (birinchi marta kiruvchi) foydalanuvchi
+            # uchun ishlaydi — eski foydalanuvchi qayta /start bosganda referral qayta yozilmaydi.
+            referred_by_user = None
+            if context.args:
+                payload = context.args[0]
+                if payload.startswith("ref_"):
+                    ref_code = payload[len("ref_"):]
+                    referred_by_user = User.query.filter_by(referral_code=ref_code).first()
+
+            db_user = User(
+                telegram_id=tg_user.id,
+                username=tg_user.username,
+                first_name=tg_user.first_name,
+                referral_code=generate_unique_referral_code(),
+                referred_by_id=referred_by_user.id if referred_by_user else None,
+            )
             db.session.add(db_user)
             db.session.commit()
 
@@ -502,21 +555,47 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["phone"] = phone
     tg_user = update.effective_user
 
+    notify_referrer = None  # (referrer_telegram_id, referrer_lang) — pastda, sessiyadan tashqarida ishlatiladi
+
     with flask_app.app_context():
         db_user = User.query.filter_by(telegram_id=tg_user.id).first()
         if not db_user:
-            db_user = User(telegram_id=tg_user.id, username=tg_user.username, first_name=tg_user.first_name)
+            db_user = User(
+                telegram_id=tg_user.id, username=tg_user.username, first_name=tg_user.first_name,
+                referral_code=generate_unique_referral_code(),
+            )
             db.session.add(db_user)
+
+        # Ism/telefon ILGARI bo'sh bo'lsa — bu foydalanuvchi UCHUN BIRINCHI marta to'liq ro'yxatdan
+        # o'tish. Faqat shu holatda taklif qilgan odamga xabar boramiz (keyingi /start larda emas).
+        is_first_registration = not db_user.full_name
+
         db_user.full_name = context.user_data["name"]
         db_user.phone = phone
         db_user.language = lang
         db.session.commit()
+
+        if is_first_registration and db_user.referred_by_id:
+            referrer = User.query.get(db_user.referred_by_id)
+            if referrer:
+                notify_referrer = (referrer.telegram_id, referrer.language or "kr")
 
     await update.message.reply_text(
         t("registered", lang, name=esc(context.user_data["name"]), phone=esc(phone)),
         reply_markup=ReplyKeyboardRemove(),
         parse_mode="HTML"
     )
+
+    if notify_referrer:
+        referrer_tg_id, referrer_lang = notify_referrer
+        try:
+            await context.bot.send_message(
+                chat_id=referrer_tg_id,
+                text=t("referral_notify_inviter", referrer_lang, name=esc(context.user_data["name"])),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning(f"Referral haqida taklif qiluvchiga xabar berilmadi: {e}")
 
     # Ro'yxatdan o'tish tugadi — endi MAJBURIY guruh a'zoligi tekshiriladi.
     # Faqat haqiqatan a'zo bo'lgandan keyingina xizmatlar menyusi ochiladi.
@@ -591,12 +670,19 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         booking_id = booking.id
 
         username_line = f"@{esc(tg_user.username)}" if tg_user.username else "username yo'q"
+        referral_line = ""
+        if db_user.referred_by_id:
+            referrer = User.query.get(db_user.referred_by_id)
+            if referrer:
+                referrer_label = esc(referrer.full_name or referrer.first_name or referrer.telegram_id)
+                referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
         admin_message = (
             f"🆕 <b>Yangi Qabul Talabi</b>\n\n"
             f"👤 Ism: {esc(context.user_data.get('name'))}\n"
             f"📱 Telefon: {esc(context.user_data.get('phone'))}\n"
             f"💬 Telegram: {username_line}\n"
             f"🔗 Profil: {user_mention_html(tg_user, label=context.user_data.get('name'))}\n"
+            f"{referral_line}"
             f"🏥 Xizmat: {esc(service.name)}\n"
             f"💰 Narxi: {service.price:,.0f} so'm\n\n"
             f"ID: {booking_id}\n"
@@ -854,6 +940,11 @@ async def show_my_booking_detail(update: Update, context: ContextTypes.DEFAULT_T
             price=f"{b.service.price:,.0f}" if b.service else "?",
             date=b.created_at.strftime("%d.%m.%Y %H:%M") if b.created_at else "",
         )
+        # Admin qabul sanasini belgilagan bo'lsa — qo'shimcha ko'rsatamiz
+        if b.appointment_at:
+            text += f"\n🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>"
+        if b.rating:
+            text += f"\n⭐ Sizning bahoyingiz: {'⭐' * b.rating}"
         can_cancel = b.status in (BookingStatus.PENDING, BookingStatus.CONFIRMED)
 
     keyboard = []
@@ -976,6 +1067,61 @@ async def show_about_clinic(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data["about_location_msg_id"] = sent_loc.message_id
         except Exception as e:
             logger.error(f"Lokatsiya yuborishda xato: {e}")
+
+
+async def show_referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Foydalanuvchining shaxsiy taklif havolasini va nechta do'stini taklif qilganini ko'rsatadi."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_lang(context)
+    tg_user = update.effective_user
+
+    with flask_app.app_context():
+        db_user = User.query.filter_by(telegram_id=tg_user.id).first()
+        if not db_user:
+            await query.answer("Xatolik yuz berdi, /start bosing.", show_alert=True)
+            return
+        if not db_user.referral_code:
+            # Eski (referral tizimidan oldingi) foydalanuvchilar uchun — birinchi kirishda kod yasab beramiz
+            db_user.referral_code = generate_unique_referral_code()
+            db.session.commit()
+        code = db_user.referral_code
+        invited_count = User.query.filter_by(referred_by_id=db_user.id).count()
+
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+
+    keyboard = [[InlineKeyboardButton(t("back_to_menu_btn", lang), callback_data="mybookings_backmenu")]]
+    await query.edit_message_text(
+        t("referral_info", lang, link=link, count=invited_count),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def rate_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mijoz qabuldan keyingi sharh so'rovida 1-5 yulduz bosganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    lang = get_lang(context)
+    tg_user = update.effective_user
+
+    try:
+        _, booking_id_str, stars_str = query.data.split("_")
+        booking_id, stars = int(booking_id_str), int(stars_str)
+    except (ValueError, IndexError):
+        return
+
+    with flask_app.app_context():
+        b = Booking.query.get(booking_id)
+        if not b or b.user.telegram_id != tg_user.id:
+            await query.answer("Bron topilmadi.", show_alert=True)
+            return
+        b.rating = stars
+        db.session.commit()
+
+    await query.edit_message_text(t("review_thanks", lang, stars="⭐" * stars), parse_mode="HTML")
 
 
 async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1102,6 +1248,107 @@ async def broadcast_worker():
         await asyncio.sleep(10)  # navbatni har 10 soniyada tekshiradi
 
 
+# ==================== ESLATMALAR VA SHARH SO'ROVI ====================
+# Fonda ishlaydigan ikkinchi worker: admin_bot.py'da admin "📅 Sana belgilash" orqali
+# appointment_at ni belgilaganda, shu worker qabulga 24 soat va 1 soat qolganda avtomatik
+# eslatma yuboradi. Shuningdek, admin bookingni "Bajarildi" deb belgilagach, mijozdan
+# 1-5 yulduzli sharh so'raydi. Har bir eslatma/so'rov FAQAT BIR MARTA yuboriladi
+# (reminder_24h_sent / reminder_1h_sent / review_requested flag'lari orqali nazorat qilinadi).
+
+async def reminder_and_review_worker():
+    """Fonda muntazam ishlaydi: yaqinlashayotgan qabullar haqida eslatma va bajarilgan
+    qabullardan keyin mijozdan sharh (baho) so'rovini yuboradi."""
+    while True:
+        try:
+            now = datetime.utcnow()
+            with flask_app.app_context():
+                # --- 24 soat qolgan eslatmalar ---
+                due_24h = Booking.query.filter(
+                    Booking.status == BookingStatus.CONFIRMED,
+                    Booking.appointment_at.isnot(None),
+                    Booking.appointment_at > now,
+                    Booking.appointment_at <= now + timedelta(hours=24),
+                    Booking.reminder_24h_sent.is_(False),
+                ).all()
+                reminders_24h = [
+                    (b.id, b.user.telegram_id, b.user.language or "kr",
+                     b.service.name if b.service else "?", b.appointment_at)
+                    for b in due_24h
+                ]
+                for b in due_24h:
+                    b.reminder_24h_sent = True
+
+                # --- 1 soat qolgan eslatmalar ---
+                due_1h = Booking.query.filter(
+                    Booking.status == BookingStatus.CONFIRMED,
+                    Booking.appointment_at.isnot(None),
+                    Booking.appointment_at > now,
+                    Booking.appointment_at <= now + timedelta(hours=1),
+                    Booking.reminder_1h_sent.is_(False),
+                ).all()
+                reminders_1h = [
+                    (b.id, b.user.telegram_id, b.user.language or "kr",
+                     b.service.name if b.service else "?", b.appointment_at)
+                    for b in due_1h
+                ]
+                for b in due_1h:
+                    b.reminder_1h_sent = True
+
+                # --- Bajarilgan, lekin hali sharh so'ralmagan bookinglar ---
+                due_review = Booking.query.filter(
+                    Booking.status == BookingStatus.COMPLETED,
+                    Booking.review_requested.is_(False),
+                ).all()
+                reviews = [
+                    (b.id, b.user.telegram_id, b.user.language or "kr",
+                     b.service.name if b.service else "?")
+                    for b in due_review
+                ]
+                for b in due_review:
+                    b.review_requested = True
+
+                db.session.commit()
+
+            for booking_id, tg_id, lang, service_name, appt in reminders_24h:
+                try:
+                    await application_instance.bot.send_message(
+                        chat_id=tg_id,
+                        text=t("reminder_24h", lang, service=esc(service_name), date=appt.strftime("%d.%m.%Y %H:%M")),
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.warning(f"24 soatlik eslatma yuborilmadi (booking {booking_id}): {e}")
+
+            for booking_id, tg_id, lang, service_name, appt in reminders_1h:
+                try:
+                    await application_instance.bot.send_message(
+                        chat_id=tg_id,
+                        text=t("reminder_1h", lang, service=esc(service_name), date=appt.strftime("%d.%m.%Y %H:%M")),
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    logger.warning(f"1 soatlik eslatma yuborilmadi (booking {booking_id}): {e}")
+
+            for booking_id, tg_id, lang, service_name in reviews:
+                try:
+                    rating_keyboard = [[
+                        InlineKeyboardButton(f"{n}⭐", callback_data=f"rate_{booking_id}_{n}") for n in range(1, 6)
+                    ]]
+                    await application_instance.bot.send_message(
+                        chat_id=tg_id,
+                        text=t("review_request", lang, service=esc(service_name)),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(rating_keyboard),
+                    )
+                except Exception as e:
+                    logger.warning(f"Sharh so'rovi yuborilmadi (booking {booking_id}): {e}")
+
+        except Exception as e:
+            logger.error(f"Eslatma/sharh worker xatosi: {e}")
+
+        await asyncio.sleep(300)  # har 5 daqiqada tekshiradi (eslatmalar soatlik aniqlikda yetarli)
+
+
 # ==================== ASOSIY DASTUR ====================
 
 async def run_bot():
@@ -1141,6 +1388,10 @@ async def run_bot():
     application.add_handler(CallbackQueryHandler(confirm_my_booking_cancel, pattern="^myb_cancel_"))
     # Biz haqimizda
     application.add_handler(CallbackQueryHandler(show_about_clinic, pattern="^about_clinic$"))
+    # Do'stni taklif qilish (referral)
+    application.add_handler(CallbackQueryHandler(show_referral_info, pattern="^referral_info$"))
+    # Qabuldan keyingi sharh (1-5 yulduz)
+    application.add_handler(CallbackQueryHandler(rate_booking, pattern="^rate_"))
     # Erkin matnli savollarga avtomatik javob — faqat shaxsiy chatda (guruh/kanalda emas) va
     # conversation FAOL BO'LMAGANDA ishlaydi
     application.add_handler(
@@ -1155,12 +1406,14 @@ async def run_bot():
     logger.info("Bot ishga tushdi — polling boshlandi")
 
     broadcast_task = asyncio.create_task(broadcast_worker())
+    reminder_task = asyncio.create_task(reminder_and_review_worker())
 
     try:
         await asyncio.Event().wait()  # Ctrl+C bosilguncha ishlaydi
     finally:
         logger.info("Bot to'xtatilmoqda...")
         broadcast_task.cancel()
+        reminder_task.cancel()
         try:
             await application.updater.stop()
         except Exception:
