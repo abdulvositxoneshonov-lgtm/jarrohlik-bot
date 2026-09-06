@@ -268,7 +268,6 @@ async def show_booking_detail(query, context: ContextTypes.DEFAULT_TYPE, booking
             f"📱 <b>Telefon:</b> {b.user.phone or '—'}\n"
             f"💬 <b>Telegram:</b> {username_line}\n\n"
             f"🏥 <b>Xizmat:</b> {b.service.name if b.service else '—'}\n"
-            f"⏱ <b>Davomiyligi:</b> {b.service.duration_minutes if b.service else '—'} daqiqa\n"
             f"💰 <b>Narxi:</b> {b.service.price:,.0f} so'm\n\n"
             f"📅 <b>Yaratilgan:</b> {b.created_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"🆔 <b>Foydalanuvchi ID:</b> {b.user.telegram_id}"
