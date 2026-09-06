@@ -1266,7 +1266,10 @@ async def reminder_and_review_worker():
                 due_24h = Booking.query.filter(
                     Booking.status == BookingStatus.CONFIRMED,
                     Booking.appointment_at.isnot(None),
-                    Booking.appointment_at > now,
+                    # "24 soat qoldi" matni faqat qabulga hali 1 soatdan KO'PROQ vaqt qolganda to'g'ri —
+                    # aks holda (masalan, qabulga 3 daqiqa qolganda) "Ertaga..." deb yuborilib, chalkashtirib
+                    # yuboradi. Bunday hollarda pastdagi 1 soatlik eslatma o'z vazifasini bajaradi.
+                    Booking.appointment_at > now + timedelta(hours=1),
                     Booking.appointment_at <= now + timedelta(hours=24),
                     Booking.reminder_24h_sent.is_(False),
                 ).all()
