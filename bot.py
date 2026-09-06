@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    ForceReply,
 )
 from telegram.ext import (
     Application,
@@ -64,6 +65,13 @@ LANG, NAME, PHONE, SUBSCRIBE, MENU, CONFIRM = range(6)
 
 # broadcast_worker() fonda xabar yuborishi uchun Application obyektiga murojaat qiladi
 application_instance = None
+
+# Guruhda "📅 Sana belgilash" bosilganda, bot ForceReply orqali savol yuboradi va shu xabarning
+# message_id'sini shu yerda vaqtincha saqlaydi ({prompt_message_id: booking_id}). Operator aynan
+# O'SHA xabarga JAVOB qilib yozgandagina bot amal qiladi — guruhdagi boshqa har qanday xabar
+# (bunday reply bo'lmagan) e'tiborsiz qoldiriladi, shuning uchun avvalgi "guruhda tasodifiy
+# xabarlarga javob berish" muammosi bu yerda TAKRORLANMAYDI.
+PENDING_GROUP_DATE_REQUESTS = {}
 
 SERVICES_DATA = [
     {"name": "🏥 Bariatrik Operatsiya", "description": "Og'irlik kamaytirish operatsiyasi", "duration_minutes": 180, "price": 3500000},
@@ -268,6 +276,62 @@ def user_mention_html(tg_user, label: str = None) -> str:
     """Foydalanuvchi profiliga bosiladigan HTML havola — username bo'lmasa ham ID orqali ochiladi."""
     name = esc(label or tg_user.first_name or "Foydalanuvchi")
     return f'<a href="tg://user?id={tg_user.id}">{name}</a>'
+
+
+GROUP_STATUS_EMOJI = {"pending": "🟡", "confirmed": "🟢", "cancelled": "🔴", "completed": "✅"}
+GROUP_STATUS_LABEL = {"pending": "Kutilmoqda", "confirmed": "Tasdiqlangan", "cancelled": "Bekor qilingan", "completed": "Bajarilgan"}
+
+
+def build_admin_card_text(b: Booking) -> str:
+    """Admin GURUHIGA yuboriladigan bildirishnoma kartochkasi matnini booking obyektidan yasaydi.
+    Bu funksiya booking holati QAYERDA o'zgarishidan qat'iy nazar (guruhning o'zida yoki admin
+    botda) chaqiriladi — shunday qilib karta HAR DOIM haqiqiy holatni ko'rsatadi.
+    FAQAT flask_app.app_context() ICHIDA, b.user va b.service yuklangan holatda chaqirilishi kerak."""
+    username_line = f"@{esc(b.user.username)}" if b.user.username else "username yo'q"
+    referral_line = ""
+    if b.user.referred_by_id:
+        referrer = User.query.get(b.user.referred_by_id)
+        if referrer:
+            referrer_label = esc(referrer.full_name or referrer.first_name or referrer.telegram_id)
+            referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
+    display_name = esc(b.user.full_name or b.user.first_name or "Foydalanuvchi")
+    text = (
+        f"{GROUP_STATUS_EMOJI.get(b.status.value, '⚪')} <b>Qabul Talabi — {GROUP_STATUS_LABEL.get(b.status.value, b.status.value)}</b>\n\n"
+        f"👤 Ism: {display_name}\n"
+        f"📱 Telefon: {esc(b.user.phone or '—')}\n"
+        f"💬 Telegram: {username_line}\n"
+        f"🔗 Profil: <a href=\"tg://user?id={b.user.telegram_id}\">{display_name}</a>\n"
+        f"{referral_line}"
+        f"🏥 Xizmat: {esc(b.service.name if b.service else '?')}\n"
+        f"💰 Narxi: {b.service.price:,.0f} so'm\n"
+    )
+    if b.appointment_at:
+        text += f"🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
+    if b.rating:
+        text += f"⭐ Mijoz bahosi: {'⭐' * b.rating}\n"
+    text += f"\nID: {b.id}\nYaratilgan: {b.created_at.strftime('%Y-%m-%d %H:%M')}"
+    return text
+
+
+def build_admin_card_keyboard(b: Booking):
+    """Booking holatiga qarab admin GURUHIDAGI kartochka tugmalarini yasaydi — o'chirish
+    tugmasi ataylab BU YERDA yo'q (o'chirish faqat admin botda, tasdiqlash bilan)."""
+    rows = []
+    top_row = []
+    if b.status != BookingStatus.CONFIRMED:
+        top_row.append(InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{b.id}"))
+    if b.status != BookingStatus.CANCELLED:
+        top_row.append(InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{b.id}"))
+    if top_row:
+        rows.append(top_row)
+    bottom_row = []
+    if b.status != BookingStatus.COMPLETED:
+        bottom_row.append(InlineKeyboardButton("✔️ Bajarildi", callback_data=f"groupdone_{b.id}"))
+    if b.status == BookingStatus.CONFIRMED:
+        bottom_row.append(InlineKeyboardButton("📅 Sana belgilash", callback_data=f"groupsetdate_{b.id}"))
+    if bottom_row:
+        rows.append(bottom_row)
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def generate_unique_referral_code() -> str:
@@ -666,38 +730,22 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db.session.add(booking)
         db.session.commit()
 
-        service = Service.query.get(context.user_data.get("service_id"))
         booking_id = booking.id
+        admin_message = build_admin_card_text(booking)
+        admin_keyboard = build_admin_card_keyboard(booking)
 
-        username_line = f"@{esc(tg_user.username)}" if tg_user.username else "username yo'q"
-        referral_line = ""
-        if db_user.referred_by_id:
-            referrer = User.query.get(db_user.referred_by_id)
-            if referrer:
-                referrer_label = esc(referrer.full_name or referrer.first_name or referrer.telegram_id)
-                referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
-        admin_message = (
-            f"🆕 <b>Yangi Qabul Talabi</b>\n\n"
-            f"👤 Ism: {esc(context.user_data.get('name'))}\n"
-            f"📱 Telefon: {esc(context.user_data.get('phone'))}\n"
-            f"💬 Telegram: {username_line}\n"
-            f"🔗 Profil: {user_mention_html(tg_user, label=context.user_data.get('name'))}\n"
-            f"{referral_line}"
-            f"🏥 Xizmat: {esc(service.name)}\n"
-            f"💰 Narxi: {service.price:,.0f} so'm\n\n"
-            f"ID: {booking_id}\n"
-            f"Vaqt: {booking.created_at.strftime('%Y-%m-%d %H:%M')}"
-        )
-
-    admin_keyboard = [[
-        InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{booking_id}"),
-        InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{booking_id}"),
-    ]]
     try:
-        await context.bot.send_message(
+        sent_msg = await context.bot.send_message(
             chat_id=CHANNEL_ID, text=admin_message, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(admin_keyboard)
+            reply_markup=admin_keyboard
         )
+        # Kartochka joylashuvini saqlaymiz — shu orqali booking holati admin BOTDA
+        # o'zgartirilganda ham, aynan shu guruh xabari real vaqtda yangilanadi
+        with flask_app.app_context():
+            b = Booking.query.get(booking_id)
+            b.group_chat_id = sent_msg.chat_id
+            b.group_message_id = sent_msg.message_id
+            db.session.commit()
     except Exception as e:
         logger.error(f"Admin notification xatosi: {e}")
 
@@ -1141,7 +1189,10 @@ async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     )
                 except Exception as e:
                     logger.error(f"Foydalanuvchini xabardor qilishda xato: {e}")
-                await query.edit_message_text(query.message.text + "\n\n✅ Tasdiqlandi.")
+                await query.edit_message_text(
+                    build_admin_card_text(booking), parse_mode="HTML",
+                    reply_markup=build_admin_card_keyboard(booking)
+                )
             else:
                 await query.answer("Qabul topilmadi!", show_alert=True)
     except Exception as e:
@@ -1165,11 +1216,101 @@ async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     )
                 except Exception as e:
                     logger.error(f"Foydalanuvchini xabardor qilishda xato: {e}")
-                await query.edit_message_text(query.message.text + "\n\n❌ Rad etildi.")
+                await query.edit_message_text(
+                    build_admin_card_text(booking), parse_mode="HTML",
+                    reply_markup=build_admin_card_keyboard(booking)
+                )
             else:
                 await query.answer("Qabul topilmadi!", show_alert=True)
     except Exception as e:
         logger.error(f"Rad etishda xato: {e}")
+
+
+async def group_mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guruhdagi '✔️ Bajarildi' tugmasi — bookingni Bajarilgan deb belgilaydi va kartani yangilaydi."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        booking_id = int(query.data.rsplit("_", 1)[1])
+        with flask_app.app_context():
+            booking = Booking.query.get(booking_id)
+            if not booking:
+                await query.answer("Booking topilmadi!", show_alert=True)
+                return
+            booking.status = BookingStatus.COMPLETED
+            db.session.commit()
+            text = build_admin_card_text(booking)
+            keyboard = build_admin_card_keyboard(booking)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"Guruhda 'Bajarildi' belgilashda xato: {e}")
+
+
+async def group_ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guruhdagi '📅 Sana belgilash' tugmasi — ForceReply orqali sana so'raydi.
+    Operator FAQAT shu xabarga javob qilib yozgandagina bot amal qiladi (pastdagi group_date_reply)."""
+    query = update.callback_query
+    await query.answer()
+    booking_id = int(query.data.rsplit("_", 1)[1])
+    prompt = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            f"📅 Booking #{booking_id} uchun qabul sanasini <b>SHU XABARGA JAVOB</b> tariqasida yozing.\n"
+            f"Format: <code>25.12.2026 14:30</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True, input_field_placeholder="KK.OO.YYYY SS:DD"),
+    )
+    PENDING_GROUP_DATE_REQUESTS[prompt.message_id] = booking_id
+
+
+async def group_date_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guruhda ForceReply so'roviga berilgan javobni qabul qiladi. FAQAT bizning promptimizga
+    JAVOB qilingan xabarlarga reaksiya beradi — boshqa har qanday guruh xabari e'tiborsiz
+    qoldiriladi, shuning uchun avvalgi 'guruhda tasodifiy javob berish' muammosi qaytmaydi."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    booking_id = PENDING_GROUP_DATE_REQUESTS.get(msg.reply_to_message.message_id)
+    if booking_id is None:
+        return  # bizning so'rovimizga javob emas
+
+    text = (msg.text or "").strip()
+    try:
+        appointment_at = datetime.strptime(text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await msg.reply_text(
+            "Format noto'g'ri. Masalan: 25.12.2026 14:30 — qaytadan '📅 Sana belgilash' tugmasini bosing."
+        )
+        del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
+        return
+
+    with flask_app.app_context():
+        booking = Booking.query.get(booking_id)
+        if not booking:
+            await msg.reply_text("Booking topilmadi.")
+            del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
+            return
+        booking.appointment_at = appointment_at
+        # Sana qayta belgilansa — eslatmalar yangi vaqt bo'yicha qayta yuborilishi uchun tiklanadi
+        booking.reminder_24h_sent = False
+        booking.reminder_1h_sent = False
+        db.session.commit()
+        card_text = build_admin_card_text(booking)
+        card_keyboard = build_admin_card_keyboard(booking)
+        g_chat_id, g_msg_id = booking.group_chat_id, booking.group_message_id
+
+    del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
+    await msg.reply_text(f"✅ Qabul sanasi belgilandi: {appointment_at.strftime('%d.%m.%Y %H:%M')}")
+
+    if g_chat_id and g_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=g_chat_id, message_id=g_msg_id, text=card_text,
+                parse_mode="HTML", reply_markup=card_keyboard
+            )
+        except Exception as e:
+            logger.warning(f"Guruh kartochkasini yangilashda xato: {e}")
 
 
 # ==================== OMMAVIY XABAR (BROADCAST) ====================
@@ -1383,6 +1524,12 @@ async def run_bot():
     application.add_handler(CallbackQueryHandler(admin_approve, pattern="^approve_"))
     application.add_handler(CallbackQueryHandler(admin_reject, pattern="^reject_"))
     application.add_handler(CallbackQueryHandler(ask_operator, pattern="^ask_operator$"))
+    # Guruhdagi "✔️ Bajarildi" / "📅 Sana belgilash" tugmalari va sana javobini qabul qilish
+    application.add_handler(CallbackQueryHandler(group_mark_completed, pattern="^groupdone_"))
+    application.add_handler(CallbackQueryHandler(group_ask_date, pattern="^groupsetdate_"))
+    application.add_handler(
+        MessageHandler(filters.Chat(chat_id=CHANNEL_ID) & filters.REPLY & filters.TEXT, group_date_reply)
+    )
     # Mening bronlarim
     application.add_handler(CallbackQueryHandler(show_my_bookings_list, pattern="^mybookings_list$"))
     application.add_handler(CallbackQueryHandler(back_to_menu_from_mybookings, pattern="^mybookings_backmenu$"))

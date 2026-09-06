@@ -16,7 +16,7 @@ import html
 from collections import Counter
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application,
     ConversationHandler,
@@ -34,6 +34,13 @@ from database import db, User, Service, Booking, FAQ, BookingStatus, QuickLink, 
 load_dotenv()
 
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN")
+# Mijozlar botining (bot.py) o'z tokeni — FAQAT admin guruhidagi bildirishnoma kartochkasini
+# real vaqtda yangilash uchun ishlatiladi (booking holati shu ADMIN BOTDA o'zgartirilganda).
+# Telegram bitta bot boshqa bot yuborgan xabarni tahrirlashiga ruxsat bermaydi, lekin ikkala
+# tokenni ham BIZ bilamiz, shuning uchun shu bitta maqsad uchun mijozlar botining tokeni bilan
+# alohida, yengil Bot obyekti yaratamiz.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+customer_bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")
 ADMIN_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
@@ -107,6 +114,79 @@ with flask_app.app_context():
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def build_group_card_text(b: Booking) -> str:
+    """bot.py'dagi build_admin_card_text() bilan BIR XIL formatni takrorlaydi — chunki bu
+    kartochkani QAYSI bot tahrirlashidan qat'iy nazar (bot.py yoki shu admin_bot.py), u bir xil
+    ko'rinishda qolishi kerak. FAQAT flask_app.app_context() ichida chaqiriladi."""
+    username_line = f"@{html.escape(b.user.username)}" if b.user.username else "username yo'q"
+    referral_line = ""
+    if b.user.referred_by_id:
+        referrer = User.query.get(b.user.referred_by_id)
+        if referrer:
+            referrer_label = html.escape(str(referrer.full_name or referrer.first_name or referrer.telegram_id))
+            referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
+    display_name = html.escape(b.user.full_name or b.user.first_name or "Foydalanuvchi")
+    text = (
+        f"{STATUS_EMOJI.get(b.status, '⚪')} <b>Qabul Talabi — {STATUS_LABEL.get(b.status, b.status.value)}</b>\n\n"
+        f"👤 Ism: {display_name}\n"
+        f"📱 Telefon: {html.escape(b.user.phone or '—')}\n"
+        f"💬 Telegram: {username_line}\n"
+        f"🔗 Profil: <a href=\"tg://user?id={b.user.telegram_id}\">{display_name}</a>\n"
+        f"{referral_line}"
+        f"🏥 Xizmat: {html.escape(b.service.name if b.service else '?')}\n"
+        f"💰 Narxi: {b.service.price:,.0f} so'm\n"
+    )
+    if b.appointment_at:
+        text += f"🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
+    if b.rating:
+        text += f"⭐ Mijoz bahosi: {'⭐' * b.rating}\n"
+    text += f"\nID: {b.id}\nYaratilgan: {b.created_at.strftime('%Y-%m-%d %H:%M')}"
+    return text
+
+
+def build_group_card_keyboard(b: Booking):
+    """bot.py'dagi build_admin_card_keyboard() bilan bir xil — o'chirish tugmasi bu yerda YO'Q."""
+    rows = []
+    top_row = []
+    if b.status != BookingStatus.CONFIRMED:
+        top_row.append(InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{b.id}"))
+    if b.status != BookingStatus.CANCELLED:
+        top_row.append(InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{b.id}"))
+    if top_row:
+        rows.append(top_row)
+    bottom_row = []
+    if b.status != BookingStatus.COMPLETED:
+        bottom_row.append(InlineKeyboardButton("✔️ Bajarildi", callback_data=f"groupdone_{b.id}"))
+    if b.status == BookingStatus.CONFIRMED:
+        bottom_row.append(InlineKeyboardButton("📅 Sana belgilash", callback_data=f"groupsetdate_{b.id}"))
+    if bottom_row:
+        rows.append(bottom_row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def sync_group_card(booking_id: int) -> None:
+    """Booking holati ADMIN BOTDA o'zgartirilganda, admin GURUHIDAGI asl bildirishnoma
+    kartochkasini ham real vaqtda yangilaydi. Agar shu booking uchun guruh kartochkasi
+    saqlanmagan bo'lsa (masalan, eski, migratsiyadan oldingi bookinglar) — jim o'tkazib yuboriladi."""
+    if not customer_bot:
+        logger.warning("TELEGRAM_BOT_TOKEN .env'da yo'q — guruh kartochkasini sinxronlab bo'lmadi.")
+        return
+    with flask_app.app_context():
+        b = Booking.query.get(booking_id)
+        if not b or not b.group_chat_id or not b.group_message_id:
+            return
+        text = build_group_card_text(b)
+        keyboard = build_group_card_keyboard(b)
+        g_chat_id, g_msg_id = b.group_chat_id, b.group_message_id
+    try:
+        await customer_bot.edit_message_text(
+            chat_id=g_chat_id, message_id=g_msg_id, text=text,
+            parse_mode="HTML", reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.warning(f"Guruh kartochkasini sinxronlashda xato (booking {booking_id}): {e}")
 
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
@@ -309,6 +389,7 @@ async def change_booking_status(query, context: ContextTypes.DEFAULT_TYPE, new_s
         b.status = BookingStatus(new_status_value)
         db.session.commit()
 
+    await sync_group_card(booking_id)
     await query.answer("✅ Status yangilandi!", show_alert=False)
     return await show_booking_detail(query, context, booking_id)
 
@@ -359,6 +440,8 @@ async def appointment_date_received(update: Update, context: ContextTypes.DEFAUL
         b.reminder_1h_sent = False
         db.session.commit()
 
+    await sync_group_card(booking_id)
+
     keyboard = [[InlineKeyboardButton("⬅️ Bookingga qaytish", callback_data=f"bk_view_{booking_id}")]]
     await update.message.reply_text(
         f"✅ Qabul sanasi belgilandi: <b>{appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
@@ -392,11 +475,24 @@ async def confirm_booking_delete(query, context: ContextTypes.DEFAULT_TYPE, book
 
 async def delete_booking(query, context: ContextTypes.DEFAULT_TYPE, booking_id: int) -> int:
     """Bitta bookingni bazadan butunlay o'chiradi."""
+    group_chat_id = group_message_id = None
     with flask_app.app_context():
         b = Booking.query.get(booking_id)
         if b:
+            group_chat_id, group_message_id = b.group_chat_id, b.group_message_id
             db.session.delete(b)
             db.session.commit()
+
+    # Guruhdagi kartochka ham bor bo'lsa — booking o'chirilganini bildirib, tugmalarni olib tashlaymiz
+    if customer_bot and group_chat_id and group_message_id:
+        try:
+            await customer_bot.edit_message_text(
+                chat_id=group_chat_id, message_id=group_message_id,
+                text="🗑 <b>Bu booking admin tomonidan butunlay o'chirildi.</b>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning(f"Guruh kartochkasini o'chirilgan deb belgilashda xato: {e}")
 
     await query.answer("🗑 O'chirildi!", show_alert=True)
     filter_key = context.user_data.get("bk_filter", "all")

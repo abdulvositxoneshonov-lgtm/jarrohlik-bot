@@ -108,6 +108,10 @@ class Booking(db.Model):
     reminder_1h_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)   # 1 soat oldin eslatma yuborilganmi
     rating: Mapped[int] = mapped_column(Integer, nullable=True)  # Mijoz qoldirgan baho (1-5)
     review_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # Sharh so'rovi yuborilganmi
+    # Admin guruhiga yuborilgan bildirishnoma kartochkasining joylashuvi — booking holati ADMIN BOTDA
+    # o'zgartirilganda ham, aynan shu kartochkani (guruhdagi) real vaqtda yangilash uchun ishlatiladi
+    group_chat_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    group_message_id: Mapped[int] = mapped_column(Integer, nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="bookings")
