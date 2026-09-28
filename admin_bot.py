@@ -30,7 +30,7 @@ from sqlalchemy import func
 from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
 from common import (
     configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text,
-    AUDIENCE_LABELS, audience_label, audience_query,
+    AUDIENCE_LABELS, audience_label, audience_query, build_daily_report,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -171,7 +171,8 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 Statistika", callback_data="adm_stats")],
         [InlineKeyboardButton("📍 Kontaktlar", callback_data="adm_contact"),
          InlineKeyboardButton("📢 Xabar yuborish", callback_data="adm_broadcast")],
-        [InlineKeyboardButton("📤 Eksport (CSV)", callback_data="adm_export")],
+        [InlineKeyboardButton("📤 Eksport (CSV)", callback_data="adm_export"),
+         InlineKeyboardButton("🗓 Kunlik hisobot", callback_data="adm_daily")],
         [InlineKeyboardButton("🚪 Chiqish", callback_data="adm_exit")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -931,6 +932,13 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             f"🏥 Xizmatlar: {services_count}\n"
             f"❓ FAQ: {faq_count}"
         )
+        keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back")]]
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return ADMIN_MENU
+
+    if data == "adm_daily":
+        with flask_app.app_context():
+            text = build_daily_report()
         keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="adm_back")]]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return ADMIN_MENU

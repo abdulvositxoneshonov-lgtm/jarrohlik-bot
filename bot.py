@@ -31,6 +31,7 @@ from common import (
     configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
     customer_status_text, STATUS_EMOJI, STATUS_LABEL,
     available_dates, free_slots, is_slot_free, WEEKDAY_SHORT, audience_query,
+    run_daily, parse_daily_time, build_daily_report,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -1758,6 +1759,22 @@ async def reminder_and_review_worker():
         await asyncio.sleep(300)  # har 5 daqiqada tekshiradi (eslatmalar soatlik aniqlikda yetarli)
 
 
+# ==================== KUNLIK HISOBOT ====================
+
+DAILY_REPORT_TIME = parse_daily_time("DAILY_REPORT_TIME", "08:00")
+
+
+async def send_daily_report():
+    """Har kuni ertalab operatorlar guruhiga bugungi qabullar va kechagi statistikani yuboradi."""
+    with flask_app.app_context():
+        text = build_daily_report()
+        # Eski (30 kundan oshgan) operator suhbati yozuvlarini tozalaymiz — jadval cheksiz o'smasin
+        OperatorThread.query.filter(OperatorThread.created_at < datetime.utcnow() - timedelta(days=30)).delete()
+        db.session.commit()
+    await application_instance.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML")
+    logger.info("Kunlik hisobot yuborildi")
+
+
 # ==================== ASOSIY DASTUR ====================
 
 async def run_bot():
@@ -1822,13 +1839,18 @@ async def run_bot():
 
     broadcast_task = asyncio.create_task(broadcast_worker())
     reminder_task = asyncio.create_task(reminder_and_review_worker())
+    background_tasks = [broadcast_task, reminder_task]
+    if DAILY_REPORT_TIME:
+        background_tasks.append(asyncio.create_task(
+            run_daily(flask_app, "daily_report", DAILY_REPORT_TIME, send_daily_report)
+        ))
 
     try:
         await asyncio.Event().wait()  # Ctrl+C bosilguncha ishlaydi
     finally:
         logger.info("Bot to'xtatilmoqda...")
-        broadcast_task.cancel()
-        reminder_task.cancel()
+        for task in background_tasks:
+            task.cancel()
         try:
             await application.updater.stop()
         except Exception:
