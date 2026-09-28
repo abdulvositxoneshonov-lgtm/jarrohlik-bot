@@ -8,7 +8,9 @@ Tibbiy markaz uchun Telegram bot + Flask admin panel. Foydalanuvchilar botda xiz
 jarrohlik-bot/
 ├── bot.py               # Telegram bot (python-telegram-bot 20.1, polling)
 ├── app.py                # Flask API + admin panel
-├── database.py           # SQLAlchemy modellar (User, Service, Booking, FAQ)
+├── admin_bot.py          # Admin boti (xizmatlar, FAQ, bookinglar, statistika, broadcast)
+├── common.py             # Ikkala bot uchun umumiy kod (guruh kartochkasi, vaqt zonasi, telefon tekshiruvi, SQLite sozlamalari)
+├── database.py           # SQLAlchemy modellar (User, Service, Booking, FAQ, ...)
 ├── seed_database.py       # Bazani boshlang'ich ma'lumotlar bilan to'ldirish
 ├── requirements.txt
 ├── .env.example
@@ -127,6 +129,21 @@ Tasdiqlangandan so'ng:
 | 👩‍⚕️ Гинекология | 60 daqiqa |
 | 👨‍⚕️ Мутахассис Консультацияси | 45 daqiqa |
 
+## ✨ Qo'shimcha imkoniyatlar
+
+| Imkoniyat | Qanday ishlaydi | Sozlama (`.env`) |
+|---|---|---|
+| 🗓 Mijoz o'zi vaqt tanlaydi | Xizmat tanlangach, bo'sh kun va soatlar tugma qilib ko'rsatiladi. Band vaqtlar ko'rinmaydi. "Vaqtni operator belgilasin" varianti ham bor | `WORK_DAYS`, `WORK_START`, `WORK_END`, `SLOT_MINUTES`, `BOOKING_DAYS_AHEAD`, `MIN_LEAD_MINUTES`, `SLOT_CAPACITY` |
+| 💬 Operator bot orqali javob beradi | Guruhdagi mijoz savoliga yoki booking kartochkasiga **reply** qiling — javob bot nomidan mijozga boradi (matn, rasm, ovoz, fayl) | — |
+| 📢 Ommaviy xabarni saralash | Admin botda xabar yozishdan oldin auditoriya tanlanadi: hammaga, faol mijozlarga, hali bron qilmaganlarga, til yoki xizmat bo'yicha | — |
+| 📊 Kunlik hisobot | Har kuni ertalab guruhga bugungi qabullar va kechagi statistika. Admin botda "🗓 Kunlik hisobot" tugmasi | `DAILY_REPORT_TIME` (bo'sh = o'chiq) |
+| 🎁 Referral bonusi | Har N ta ro'yxatdan o'tgan do'st uchun X% chegirmali promo-kod. Bron paytida qo'llanadi, bron bekor qilinsa qaytariladi | `REFERRAL_BONUS_EVERY`, `REFERRAL_BONUS_PERCENT` |
+| 💾 Avtomatik zaxira nusxa | Har kecha baza nusxasi `backups/` papkasiga saqlanadi va adminlarga yuboriladi. Admin botda "💾 Zaxira nusxa" tugmasi | `BACKUP_TIME` (bo'sh = o'chiq), `BACKUP_KEEP` |
+
+> Bazaga yangi ustun yoki jadval qo'shilganda eski `bot.db` o'chirilmaydi — bot ishga tushganda ular avtomatik qo'shiladi.
+
+**Zaxira nusxadan tiklash:** ikkala botni to'xtating, so'ng `gunzip -c backups/bot_YYYYMMDD_HHMMSS.db.gz > instance/bot.db` buyrug'ini bajaring va botlarni qayta ishga tushiring.
+
 ## 🔌 API Endpoints
 
 Barcha javoblar JSON: `{"success": true/false, "data": ..., "count": ...}` yoki xato holida `{"error": "..."}`.
@@ -206,6 +223,9 @@ Bazani hali seed qilmagansiz yoki jadvallar yaratilmagan. `python seed_database.
 - Bot `CHANNEL_ID` bilan ko'rsatilgan guruhga qo'shilganini tekshiring
 - Guruh ID manfiy son bo'lishi kerak (masalan `-5127216730`); superguruh bo'lsa ID odatda `-100` bilan boshlanadi
 - Botga guruhda xabar yuborish huquqi (admin yoki oddiy a'zo, guruh sozlamalariga qarab) berilganini tekshiring
+
+**Eslatmalar noto'g'ri vaqtda kelyapti**
+Operator kiritgan qabul vaqti `.env` dagi `TIMEZONE` (standart: `Asia/Tashkent`) bo'yicha talqin qilinadi. Serveringiz boshqa zonada bo'lsa ham shu qiymat to'g'ri turganini tekshiring.
 
 **`instance/bot.db` topilmayapti yoki eski ma'lumotlar ko'rinyapti**
 Flask-SQLAlchemy nisbiy `sqlite:///bot.db` yo'lini ishga tushirilgan joydan qat'i nazar `instance/` papkasiga joylaydi. Bazani butunlay tozalash uchun `instance/` papkasini o'chirib, `python seed_database.py` ni qayta ishga tushiring.

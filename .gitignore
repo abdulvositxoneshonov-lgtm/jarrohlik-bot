@@ -6,3 +6,5 @@ bot.db
 .env
 .env.local
 instance/
+backups/
+broadcast_images/
