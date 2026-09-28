@@ -129,6 +129,21 @@ Tasdiqlangandan so'ng:
 | 👩‍⚕️ Гинекология | 60 daqiqa |
 | 👨‍⚕️ Мутахассис Консультацияси | 45 daqiqa |
 
+## ✨ Qo'shimcha imkoniyatlar
+
+| Imkoniyat | Qanday ishlaydi | Sozlama (`.env`) |
+|---|---|---|
+| 🗓 Mijoz o'zi vaqt tanlaydi | Xizmat tanlangach, bo'sh kun va soatlar tugma qilib ko'rsatiladi. Band vaqtlar ko'rinmaydi. "Vaqtni operator belgilasin" varianti ham bor | `WORK_DAYS`, `WORK_START`, `WORK_END`, `SLOT_MINUTES`, `BOOKING_DAYS_AHEAD`, `MIN_LEAD_MINUTES`, `SLOT_CAPACITY` |
+| 💬 Operator bot orqali javob beradi | Guruhdagi mijoz savoliga yoki booking kartochkasiga **reply** qiling — javob bot nomidan mijozga boradi (matn, rasm, ovoz, fayl) | — |
+| 📢 Ommaviy xabarni saralash | Admin botda xabar yozishdan oldin auditoriya tanlanadi: hammaga, faol mijozlarga, hali bron qilmaganlarga, til yoki xizmat bo'yicha | — |
+| 📊 Kunlik hisobot | Har kuni ertalab guruhga bugungi qabullar va kechagi statistika. Admin botda "🗓 Kunlik hisobot" tugmasi | `DAILY_REPORT_TIME` (bo'sh = o'chiq) |
+| 🎁 Referral bonusi | Har N ta ro'yxatdan o'tgan do'st uchun X% chegirmali promo-kod. Bron paytida qo'llanadi, bron bekor qilinsa qaytariladi | `REFERRAL_BONUS_EVERY`, `REFERRAL_BONUS_PERCENT` |
+| 💾 Avtomatik zaxira nusxa | Har kecha baza nusxasi `backups/` papkasiga saqlanadi va adminlarga yuboriladi. Admin botda "💾 Zaxira nusxa" tugmasi | `BACKUP_TIME` (bo'sh = o'chiq), `BACKUP_KEEP` |
+
+> Bazaga yangi ustun yoki jadval qo'shilganda eski `bot.db` o'chirilmaydi — bot ishga tushganda ular avtomatik qo'shiladi.
+
+**Zaxira nusxadan tiklash:** ikkala botni to'xtating, so'ng `gunzip -c backups/bot_YYYYMMDD_HHMMSS.db.gz > instance/bot.db` buyrug'ini bajaring va botlarni qayta ishga tushiring.
+
 ## 🔌 API Endpoints
 
 Barcha javoblar JSON: `{"success": true/false, "data": ..., "count": ...}` yoki xato holida `{"error": "..."}`.

@@ -13,6 +13,9 @@ import asyncio
 import io
 import uuid
 import html
+import gzip
+import shutil
+import sqlite3
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
@@ -31,6 +34,7 @@ from database import db, create_all_with_indexes, User, Service, Booking, FAQ, B
 from common import (
     configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text,
     AUDIENCE_LABELS, audience_label, audience_query, build_daily_report, release_promo,
+    run_daily, parse_daily_time,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -173,6 +177,7 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📢 Xabar yuborish", callback_data="adm_broadcast")],
         [InlineKeyboardButton("📤 Eksport (CSV)", callback_data="adm_export"),
          InlineKeyboardButton("🗓 Kunlik hisobot", callback_data="adm_daily")],
+        [InlineKeyboardButton("💾 Zaxira nusxa", callback_data="adm_backup")],
         [InlineKeyboardButton("🚪 Chiqish", callback_data="adm_exit")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -942,6 +947,14 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return ADMIN_MENU
 
+    if data == "adm_backup":
+        try:
+            await send_backup(context.bot, [query.from_user.id])
+        except Exception as e:
+            logger.error(f"Zaxira nusxa xatosi: {e}")
+            await query.message.reply_text(f"❌ Zaxira nusxa olinmadi: {e}")
+        return ADMIN_MENU
+
     if data == "adm_daily":
         with flask_app.app_context():
             text = build_daily_report()
@@ -1232,6 +1245,69 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+# ==================== AVTOMATIK ZAXIRA NUSXA ====================
+
+BACKUP_TIME = parse_daily_time("BACKUP_TIME", "03:00")
+BACKUP_KEEP = max(1, int(os.getenv("BACKUP_KEEP", "7") or 7))
+BACKUPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024  # Telegram bot API: 50 MB
+
+
+def _sqlite_path():
+    with flask_app.app_context():
+        url = db.engine.url
+    return url.database if url.get_backend_name() == "sqlite" and url.database else None
+
+
+def create_backup_file():
+    """SQLite bazaning izchil nusxasini (ishlayotgan paytda ham xavfsiz — sqlite3 backup API) olib,
+    gzip bilan siqib backups/ papkasiga saqlaydi. Eng yangi BACKUP_KEEP tasi qoldiriladi.
+    Sinxron funksiya — asyncio.to_thread orqali chaqiriladi."""
+    src_path = _sqlite_path()
+    if not src_path or not os.path.exists(src_path):
+        raise RuntimeError("Zaxira nusxa faqat SQLite baza uchun ishlaydi (baza fayli topilmadi).")
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
+    stamp = local_now().strftime("%Y%m%d_%H%M%S")
+    raw_path = os.path.join(BACKUPS_DIR, f"bot_{stamp}.db")
+    gz_path = raw_path + ".gz"
+
+    src = sqlite3.connect(src_path)
+    dst = sqlite3.connect(raw_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    with open(raw_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.remove(raw_path)
+
+    backups = sorted(f for f in os.listdir(BACKUPS_DIR) if f.startswith("bot_") and f.endswith(".db.gz"))
+    for old in backups[:-BACKUP_KEEP]:
+        os.remove(os.path.join(BACKUPS_DIR, old))
+    return gz_path
+
+
+async def send_backup(bot, chat_ids) -> str:
+    """Zaxira nusxa yaratib, berilgan adminlarga shaxsiy chatda yuboradi. Fayl yo'lini qaytaradi."""
+    path = await asyncio.to_thread(create_backup_file)
+    size = os.path.getsize(path)
+    caption = f"💾 Zaxira nusxa: {os.path.basename(path)} ({size / 1024:.0f} KB)"
+    if size > TELEGRAM_FILE_LIMIT:
+        caption += "\n⚠️ Fayl Telegram uchun juda katta — faqat serverda saqlandi."
+    for chat_id in chat_ids:
+        try:
+            if size > TELEGRAM_FILE_LIMIT:
+                await bot.send_message(chat_id=chat_id, text=caption)
+            else:
+                with open(path, "rb") as f:
+                    await bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(path), caption=caption)
+        except Exception as e:
+            logger.warning(f"Zaxira nusxani adminga ({chat_id}) yuborib bo'lmadi: {e}")
+    logger.info(f"Zaxira nusxa yaratildi: {path}")
+    return path
+
+
 # ==================== ASOSIY DASTUR ====================
 
 async def run_bot():
@@ -1285,10 +1361,18 @@ async def run_bot():
     await application.updater.start_polling()
     logger.info("Admin bot ishga tushdi — polling boshlandi")
 
+    backup_task = None
+    if BACKUP_TIME and _sqlite_path():
+        backup_task = asyncio.create_task(run_daily(
+            flask_app, "daily_backup", BACKUP_TIME, lambda: send_backup(application.bot, ADMIN_IDS)
+        ))
+
     try:
         await asyncio.Event().wait()  # Ctrl+C bosilguncha ishlaydi
     finally:
         logger.info("Admin bot to'xtatilmoqda...")
+        if backup_task:
+            backup_task.cancel()
         try:
             await application.updater.stop()
         except Exception:
