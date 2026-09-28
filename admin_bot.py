@@ -30,7 +30,7 @@ from sqlalchemy import func
 from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
 from common import (
     configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text,
-    AUDIENCE_LABELS, audience_label, audience_query, build_daily_report,
+    AUDIENCE_LABELS, audience_label, audience_query, build_daily_report, release_promo,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -364,6 +364,8 @@ async def change_booking_status(query, context: ContextTypes.DEFAULT_TYPE, new_s
         new_status = BookingStatus(new_status_value)
         changed = b.status != new_status
         b.status = new_status
+        if new_status == BookingStatus.CANCELLED:
+            release_promo(b)
         db.session.commit()
 
     await sync_group_card(booking_id)
@@ -462,6 +464,8 @@ async def delete_booking(query, context: ContextTypes.DEFAULT_TYPE, booking_id: 
         b = db.session.get(Booking, booking_id)
         if b:
             group_chat_id, group_message_id = b.group_chat_id, b.group_message_id
+            if b.status != BookingStatus.COMPLETED:
+                release_promo(b)
             db.session.delete(b)
             db.session.commit()
 
@@ -517,6 +521,8 @@ async def bulk_delete_bookings(query, context: ContextTypes.DEFAULT_TYPE, filter
         bookings = q.all()
         deleted = len(bookings)
         for b in bookings:
+            if b.status != BookingStatus.COMPLETED:
+                release_promo(b)
             db.session.delete(b)
         db.session.commit()
 

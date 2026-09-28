@@ -26,12 +26,14 @@ from telegram.ext import (
 )
 from telegram.error import Forbidden, RetryAfter
 from flask import Flask
-from database import db, create_all_with_indexes, OperatorThread, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from database import db, create_all_with_indexes, OperatorThread, PromoCode, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
 from common import (
     configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
     customer_status_text, STATUS_EMOJI, STATUS_LABEL,
     available_dates, free_slots, is_slot_free, WEEKDAY_SHORT, audience_query,
     run_daily, parse_daily_time, build_daily_report,
+    REFERRAL_BONUS_EVERY, REFERRAL_BONUS_PERCENT, discounted_price, registered_referrals_count,
+    award_referral_bonus, get_active_promo, apply_promo, release_promo,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -285,6 +287,24 @@ TEXTS = {
         "lt": "✅ Rahmat! Sizning bahoyingiz: {stars}\n\nFikringiz biz uchun juda muhim. 🙏",
         "kr": "✅ Раҳмат! Сизнинг баҳойингиз: {stars}\n\nФикрингиз биз учун жуда муҳим. 🙏",
     },
+    "referral_progress": {
+        "lt": "\n\n🎯 Har <b>{every}</b> ta ro'yxatdan o'tgan do'st uchun — <b>{percent}% chegirma</b> promo-kodi!\nKeyingi bonusgacha: <b>{left}</b> ta do'st",
+        "kr": "\n\n🎯 Ҳар <b>{every}</b> та рўйхатдан ўтган дўст учун — <b>{percent}% чегирма</b> промо-коди!\nКейинги бонусгача: <b>{left}</b> та дўст",
+    },
+    "referral_active_codes": {
+        "lt": "\n\n🎁 Sizning promo-kodlaringiz: {codes}\n<i>Keyingi bron qilishda chegirma taklif qilinadi.</i>",
+        "kr": "\n\n🎁 Сизнинг промо-кодларингиз: {codes}\n<i>Кейинги брон қилишда чегирма таклиф қилинади.</i>",
+    },
+    "referral_bonus_awarded": {
+        "lt": "🎉 <b>Tabriklaymiz!</b> Siz {every} ta do'stingizni taklif qildingiz va <b>{percent}% chegirma</b> oldingiz!\n\n🎁 Promo-kod: <code>{code}</code>\n\nKeyingi bron qilishda chegirma avtomatik taklif qilinadi. 🙏",
+        "kr": "🎉 <b>Табриклаймиз!</b> Сиз {every} та дўстингизни таклиф қилдингиз ва <b>{percent}% чегирма</b> олдингиз!\n\n🎁 Промо-код: <code>{code}</code>\n\nКейинги брон қилишда чегирма автоматик таклиф қилинади. 🙏",
+    },
+    "promo_available": {
+        "lt": "\n\n🎁 Sizda <b>{percent}% chegirma</b> bor (<code>{code}</code>) — chegirma bilan: <b>{price} so'm</b>",
+        "kr": "\n\n🎁 Сизда <b>{percent}% чегирма</b> бор (<code>{code}</code>) — чегирма билан: <b>{price} сўм</b>",
+    },
+    "confirm_promo_btn": {"lt": "🎁 Chegirma bilan tasdiqlash", "kr": "🎁 Чегирма билан тасдиқлаш"},
+    "confirm_no_promo_btn": {"lt": "✅ Chegirmasiz tasdiqlash", "kr": "✅ Чегирмасиз тасдиқлаш"},
     "operator_reply_header": {
         "lt": "👨‍⚕️ <b>Operator javobi:</b>",
         "kr": "👨‍⚕️ <b>Оператор жавоби:</b>",
@@ -626,6 +646,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     tg_user = update.effective_user
 
     notify_referrer = None  # (referrer_telegram_id, referrer_lang) — pastda, sessiyadan tashqarida ishlatiladi
+    bonus_code = None       # taklif qiluvchiga shu ro'yxatdan o'tish tufayli berilgan yangi promo-kod
 
     with flask_app.app_context():
         db_user = User.query.filter_by(telegram_id=tg_user.id).first()
@@ -649,6 +670,8 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             referrer = db.session.get(User, db_user.referred_by_id)
             if referrer:
                 notify_referrer = (referrer.telegram_id, referrer.language or "kr")
+                promo = award_referral_bonus(referrer)
+                bonus_code = promo.code if promo else None
 
     await update.message.reply_text(
         t("registered", lang, name=esc(context.user_data["name"]), phone=esc(phone)),
@@ -666,6 +689,16 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
         except Exception as e:
             logger.warning(f"Referral haqida taklif qiluvchiga xabar berilmadi: {e}")
+        if bonus_code:
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_tg_id,
+                    text=t("referral_bonus_awarded", referrer_lang, every=REFERRAL_BONUS_EVERY,
+                           percent=REFERRAL_BONUS_PERCENT, code=bonus_code),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning(f"Referral bonusi haqida xabar berilmadi: {e}")
 
     # Ro'yxatdan o'tish tugadi — endi MAJBURIY guruh a'zoligi tekshiriladi.
     # Faqat haqiqatan a'zo bo'lgandan keyingina xizmatlar menyusi ochiladi.
@@ -817,11 +850,20 @@ async def show_confirm(query, context: ContextTypes.DEFAULT_TYPE, note_key: str 
                        if slot else t("slot_line_operator", lang)),
             note=t(note_key or ("note_chosen" if slot else "note_operator"), lang),
         )
+        db_user = User.query.filter_by(telegram_id=query.from_user.id).first()
+        promo = get_active_promo(db_user.id) if db_user else None
+        if promo:
+            text += t("promo_available", lang, percent=promo.discount_percent, code=promo.code,
+                      price=f"{discounted_price(service.price, promo.discount_percent):,.0f}")
 
-    keyboard = [
-        [InlineKeyboardButton(t("confirm_btn", lang), callback_data="confirm")],
-        [InlineKeyboardButton(t("other_day_btn", lang), callback_data="back")],
-    ]
+    if promo:
+        keyboard = [
+            [InlineKeyboardButton(t("confirm_promo_btn", lang), callback_data="confirm_promo")],
+            [InlineKeyboardButton(t("confirm_no_promo_btn", lang), callback_data="confirm")],
+        ]
+    else:
+        keyboard = [[InlineKeyboardButton(t("confirm_btn", lang), callback_data="confirm")]]
+    keyboard.append([InlineKeyboardButton(t("other_day_btn", lang), callback_data="back")])
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return CONFIRM
 
@@ -851,6 +893,10 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             status=BookingStatus.PENDING,
             appointment_at=slot,
         )
+        if query.data == "confirm_promo":
+            promo = get_active_promo(db_user.id)
+            if promo:
+                apply_promo(booking, promo)
         db.session.add(booking)
         db.session.commit()
 
@@ -1153,7 +1199,7 @@ async def show_my_booking_detail(update: Update, context: ContextTypes.DEFAULT_T
             emoji=STATUS_EMOJI.get(b.status.value, "⚪"),
             status=STATUS_LABEL.get(b.status.value, b.status.value),
             service=esc(b.service.name if b.service else "?"),
-            price=f"{b.service.price:,.0f}" if b.service else "?",
+            price=(f"{discounted_price(b.service.price, b.discount_percent):,.0f}" if b.service else "?"),
             date=b.created_at.strftime("%d.%m.%Y %H:%M") if b.created_at else "",
         )
         # Admin qabul sanasini belgilagan bo'lsa — qo'shimcha ko'rsatamiz
@@ -1212,6 +1258,7 @@ async def do_my_booking_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Bu bronni bekor qilib bo'lmaydi.", show_alert=True)
             return
         b.status = BookingStatus.CANCELLED
+        release_promo(b)
         db.session.commit()
         svc_name = b.service.name if b.service else "?"
         display_name = context.user_data.get("name") or tg_user.first_name or "Foydalanuvchi"
@@ -1310,13 +1357,25 @@ async def show_referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
             db.session.commit()
         code = db_user.referral_code
         invited_count = User.query.filter_by(referred_by_id=db_user.id).count()
+        registered_count = registered_referrals_count(db_user.id)
+        active_codes = [
+            p.code for p in PromoCode.query.filter_by(user_id=db_user.id, is_used=False).order_by(PromoCode.id)
+        ]
 
     bot_username = context.bot.username
     link = f"https://t.me/{bot_username}?start=ref_{code}"
 
+    referral_text = t("referral_info", lang, link=link, count=invited_count)
+    if REFERRAL_BONUS_PERCENT > 0:
+        left = REFERRAL_BONUS_EVERY - registered_count % REFERRAL_BONUS_EVERY
+        referral_text += t("referral_progress", lang, every=REFERRAL_BONUS_EVERY,
+                           percent=REFERRAL_BONUS_PERCENT, left=left)
+    if active_codes:
+        referral_text += t("referral_active_codes", lang, codes=", ".join(f"<code>{c}</code>" for c in active_codes))
+
     keyboard = [[InlineKeyboardButton(t("back_to_menu_btn", lang), callback_data="mybookings_backmenu")]]
     await query.edit_message_text(
-        t("referral_info", lang, link=link, count=invited_count),
+        referral_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -1400,6 +1459,8 @@ async def group_change_status(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("Holat allaqachon shunday.")
             return
         booking.status = new_status
+        if new_status == BookingStatus.CANCELLED:
+            release_promo(booking)
         db.session.commit()
         card_text = build_admin_card_text(booking)
         card_keyboard = build_admin_card_keyboard(booking)
@@ -1792,7 +1853,7 @@ async def run_bot():
             MENU: [CallbackQueryHandler(select_service, pattern="^svc_")],
             PICK_DATE: [CallbackQueryHandler(pick_date, pattern="^date_")],
             PICK_TIME: [CallbackQueryHandler(pick_time, pattern="^time_")],
-            CONFIRM: [CallbackQueryHandler(confirm_booking, pattern="^(confirm|back)$")],
+            CONFIRM: [CallbackQueryHandler(confirm_booking, pattern="^(confirm|confirm_promo|back)$")],
         },
         fallbacks=[
             CommandHandler("start", start, filters=filters.ChatType.PRIVATE),

@@ -10,13 +10,14 @@ import html
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, date, time, timedelta
 
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from database import db, User, Service, Booking, BookingStatus, AppState
+from database import db, User, Service, Booking, BookingStatus, AppState, PromoCode
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,9 @@ def build_admin_card_text(b: Booking) -> str:
     )
     if b.service:
         text += f"💰 Narxi: {b.service.price:,.0f} so'm\n"
+        if b.discount_percent:
+            text += (f"🎁 Referral chegirmasi: {b.discount_percent}% → "
+                     f"<b>{discounted_price(b.service.price, b.discount_percent):,.0f} so'm</b>\n")
     if b.appointment_at:
         text += f"🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
     if b.rating:
@@ -411,3 +415,66 @@ def build_daily_report(day: date = None) -> str:
     if rating_count:
         lines.append(f"⭐ O'rtacha baho: {avg_rating:.1f}/5 ({rating_count} ta sharh)")
     return "\n".join(lines)
+
+
+# ==================== REFERRAL BONUSI (PROMO-KODLAR) ====================
+
+REFERRAL_BONUS_EVERY = max(1, int(os.getenv("REFERRAL_BONUS_EVERY", "3") or 3))   # har N ta do'st uchun
+REFERRAL_BONUS_PERCENT = int(os.getenv("REFERRAL_BONUS_PERCENT", "10") or 0)        # 0 = bonus o'chirilgan
+
+
+def discounted_price(price: float, percent: int) -> float:
+    return price * (100 - (percent or 0)) / 100
+
+
+def registered_referrals_count(user_id: int) -> int:
+    """Shu mijoz taklif qilgan va TO'LIQ ro'yxatdan o'tgan (ism + telefon) do'stlar soni."""
+    return User.query.filter(
+        User.referred_by_id == user_id, User.full_name.isnot(None), User.phone.isnot(None)
+    ).count()
+
+
+def award_referral_bonus(referrer: User):
+    """Har REFERRAL_BONUS_EVERY ta do'st uchun bitta promo-kod beradi. Yangi kod berilgan bo'lsa
+    uni qaytaradi, aks holda None. app_context ichida chaqiriladi."""
+    if REFERRAL_BONUS_PERCENT <= 0:
+        return None
+    earned = registered_referrals_count(referrer.id) // REFERRAL_BONUS_EVERY
+    issued = PromoCode.query.filter_by(user_id=referrer.id).count()
+    if earned <= issued:
+        return None
+    code = None
+    for _ in range(5):
+        candidate = "BONUS-" + uuid.uuid4().hex[:6].upper()
+        if not PromoCode.query.filter_by(code=candidate).first():
+            code = candidate
+            break
+    promo = PromoCode(code=code or "BONUS-" + uuid.uuid4().hex[:10].upper(),
+                      user_id=referrer.id, discount_percent=REFERRAL_BONUS_PERCENT)
+    db.session.add(promo)
+    db.session.commit()
+    return promo
+
+
+def get_active_promo(user_id: int):
+    """Mijozning eng eski ishlatilmagan promo-kodi (yoki None)."""
+    return PromoCode.query.filter_by(user_id=user_id, is_used=False).order_by(PromoCode.id).first()
+
+
+def apply_promo(booking: Booking, promo: PromoCode) -> None:
+    promo.is_used = True
+    promo.used_at = datetime.utcnow()
+    booking.promo_code_id = promo.id
+    booking.discount_percent = promo.discount_percent
+
+
+def release_promo(booking: Booking) -> None:
+    """Bron bekor qilinsa yoki o'chirilsa — ishlatilgan promo-kod mijozga qaytariladi (commit chaqiruvchida)."""
+    if not booking.promo_code_id:
+        return
+    promo = db.session.get(PromoCode, booking.promo_code_id)
+    if promo:
+        promo.is_used = False
+        promo.used_at = None
+    booking.promo_code_id = None
+    booking.discount_percent = None
