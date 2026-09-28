@@ -30,7 +30,7 @@ from database import db, create_all_with_indexes, OperatorThread, User, Service,
 from common import (
     configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
     customer_status_text, STATUS_EMOJI, STATUS_LABEL,
-    available_dates, free_slots, is_slot_free, WEEKDAY_SHORT,
+    available_dates, free_slots, is_slot_free, WEEKDAY_SHORT, audience_query,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -1543,10 +1543,7 @@ async def broadcast_worker():
                 image_path = None
                 telegram_ids = []
                 if pending:
-                    telegram_ids = [
-                        tg_id for (tg_id,) in db.session.query(User.telegram_id)
-                        .filter(User.full_name.isnot(None), User.phone.isnot(None))
-                    ]
+                    telegram_ids = [tg_id for (tg_id,) in audience_query(pending.audience)]
                     pending.status = "sending"
                     pending.total_count = len(telegram_ids)
                     db.session.commit()

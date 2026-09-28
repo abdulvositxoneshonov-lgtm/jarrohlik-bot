@@ -28,7 +28,10 @@ from telegram.ext import (
 from flask import Flask
 from sqlalchemy import func
 from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
-from common import configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text
+from common import (
+    configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text,
+    AUDIENCE_LABELS, audience_label, audience_query,
+)
 
 # ==================== SOZLAMALAR ====================
 
@@ -677,27 +680,53 @@ async def clinic_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Rasm bot.py orqali qayta yuklanishi kerak (Telegram file_id botlar orasida ishlamaydi),
 # shuning uchun rasm shu yerda lokal papkaga saqlanadi va bazaga faqat fayl yo'li yoziladi.
 
-def get_broadcast_audience_count() -> int:
+def get_broadcast_audience_count(audience: str = "all") -> int:
     with flask_app.app_context():
-        return User.query.filter(User.full_name.isnot(None), User.phone.isnot(None)).count()
+        return audience_query(audience).count()
 
 
 async def start_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Broadcast bosqichini boshlaydi — avval sarlavha so'raladi."""
-    audience = get_broadcast_audience_count()
-
-    if audience == 0:
+    """Broadcast bosqichini boshlaydi — avval KIMGA yuborilishi (auditoriya) tanlanadi."""
+    if get_broadcast_audience_count("all") == 0:
         await query.answer("Hozircha ro'yxatdan o'tgan mijozlar yo'q.", show_alert=True)
         return ADMIN_MENU
 
-    context.user_data.pop("broadcast_headline", None)
-    context.user_data.pop("broadcast_text", None)
-    context.user_data.pop("broadcast_image_path", None)
+    for key in ("broadcast_headline", "broadcast_text", "broadcast_image_path", "broadcast_audience"):
+        context.user_data.pop(key, None)
+
+    with flask_app.app_context():
+        options = [(key, label, audience_query(key).count()) for key, label in AUDIENCE_LABELS.items()]
+        services = Service.query.order_by(Service.id).all()
+        options += [
+            (f"service:{s.id}", s.name, audience_query(f"service:{s.id}").count()) for s in services
+        ]
+
+    keyboard = [
+        [InlineKeyboardButton(f"{label} ({count})", callback_data=f"bca_{key}")]
+        for key, label, count in options if count > 0
+    ]
+    keyboard.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="adm_back")])
+    await query.edit_message_text(
+        "📢 Ommaviy xabar yuborish\n\nKimga yuborilsin? (qavs ichida — mijozlar soni)",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_MENU
+
+
+async def broadcast_audience_selected(query, context: ContextTypes.DEFAULT_TYPE, audience: str) -> int:
+    """Auditoriya tanlandi — endi sarlavha so'raladi."""
+    count = get_broadcast_audience_count(audience)
+    if count == 0:
+        await query.answer("Bu guruhda mijozlar yo'q.", show_alert=True)
+        return ADMIN_MENU
+    context.user_data["broadcast_audience"] = audience
+    with flask_app.app_context():
+        label = audience_label(audience)
 
     keyboard = [[InlineKeyboardButton("❌ Bekor qilish", callback_data="adm_back")]]
     await query.edit_message_text(
         f"📢 Ommaviy xabar yuborish (1/3)\n\n"
-        f"👥 Qabul qiluvchilar: {audience} ta ro'yxatdan o'tgan mijoz\n\n"
+        f"👥 Qabul qiluvchilar: {label} — {count} ta mijoz\n\n"
         f"Avval xabar SARLAVHASINI (headline) yozing:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -758,12 +787,16 @@ async def show_broadcast_preview(message_target, context: ContextTypes.DEFAULT_T
     headline = _html.escape(context.user_data.get("broadcast_headline", ""))
     text = _html.escape(context.user_data.get("broadcast_text", ""))
     image_path = context.user_data.get("broadcast_image_path")
-    audience = get_broadcast_audience_count()
+    audience_key = context.user_data.get("broadcast_audience", "all")
+    audience = get_broadcast_audience_count(audience_key)
+    with flask_app.app_context():
+        label = _html.escape(audience_label(audience_key))
 
     preview = f"📢 <b>{headline}</b>\n\n{text}"
     caption = (
         f"👁 <b>Ko'rib chiqish:</b>\n\n{preview}\n\n"
         f"{'🖼 (rasm biriktirilgan)' if image_path else '(rasmsiz)'}\n\n"
+        f"👥 {label}\n"
         f"— {audience} ta mijozga yuborishni tasdiqlaysizmi? —"
     )
     keyboard = [
@@ -785,13 +818,14 @@ async def confirm_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     headline = context.user_data.pop("broadcast_headline", None)
     text = context.user_data.pop("broadcast_text", None)
     image_path = context.user_data.pop("broadcast_image_path", None)
+    audience = context.user_data.pop("broadcast_audience", "all")
 
     if not text:
         await query.answer("Xabar topilmadi, qaytadan urinib ko'ring.", show_alert=True)
         return await start_broadcast(query, context)
 
     with flask_app.app_context():
-        bm = BroadcastMessage(headline=headline, text=text, image_path=image_path, status="pending")
+        bm = BroadcastMessage(headline=headline, text=text, image_path=image_path, status="pending", audience=audience)
         db.session.add(bm)
         db.session.commit()
 
@@ -808,6 +842,7 @@ async def cancel_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("broadcast_headline", None)
     context.user_data.pop("broadcast_text", None)
     context.user_data.pop("broadcast_image_path", None)
+    context.user_data.pop("broadcast_audience", None)
     await query.message.reply_text("Bekor qilindi.", reply_markup=admin_main_keyboard())
     return ADMIN_MENU
 
@@ -963,6 +998,9 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     if data == "adm_broadcast":
         return await start_broadcast(query, context)
+
+    if data.startswith("bca_"):
+        return await broadcast_audience_selected(query, context, data[len("bca_"):])
 
     if data == "bc_skip_image":
         return await skip_broadcast_image(query, context)

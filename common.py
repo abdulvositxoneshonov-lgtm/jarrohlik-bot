@@ -14,7 +14,7 @@ from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from database import db, User, Booking, BookingStatus
+from database import db, User, Service, Booking, BookingStatus
 
 try:
     from zoneinfo import ZoneInfo
@@ -238,3 +238,51 @@ def customer_status_text(kind: str, lang: str, **kwargs) -> str:
         label = "Сана" if lang == "kr" else "Sana"
         kwargs["date_line"] = f"\n📅 {label}: <b>{appt.strftime('%d.%m.%Y %H:%M')}</b>" if appt else ""
     return texts.get(lang, texts["kr"]).format(**kwargs)
+
+
+# ==================== OMMAVIY XABAR AUDITORIYASI ====================
+# Kalitlar BroadcastMessage.audience ustunida saqlanadi. "service:<id>" — shu xizmatga yozilganlar.
+
+AUDIENCE_LABELS = {
+    "all": "👥 Barcha mijozlar",
+    "active30": "🔥 So'nggi 30 kunda bron qilganlar",
+    "completed": "✅ Qabulda bo'lganlar (bajarilgan bron)",
+    "nobooking": "🆕 Hali bron qilmaganlar",
+    "lang:lt": "🔤 Lotin tilidagilar",
+    "lang:kr": "🔤 Kirill tilidagilar",
+}
+
+
+def audience_label(audience: str) -> str:
+    audience = audience or "all"
+    if audience.startswith("service:"):
+        try:
+            svc = db.session.get(Service, int(audience.split(":", 1)[1]))
+        except ValueError:
+            svc = None
+        return f"{svc.name if svc else '?'} xizmatiga yozilganlar"
+    return AUDIENCE_LABELS.get(audience, AUDIENCE_LABELS["all"])
+
+
+def audience_query(audience: str):
+    """Tanlangan auditoriyadagi ro'yxatdan o'tgan mijozlarning telegram_id so'rovi. app_context ichida."""
+    audience = audience or "all"
+    q = db.session.query(User.telegram_id).filter(User.full_name.isnot(None), User.phone.isnot(None))
+    booked_users = db.session.query(Booking.user_id)
+    if audience == "active30":
+        q = q.filter(User.id.in_(booked_users.filter(Booking.created_at >= datetime.utcnow() - timedelta(days=30))))
+    elif audience == "completed":
+        q = q.filter(User.id.in_(booked_users.filter(Booking.status == BookingStatus.COMPLETED)))
+    elif audience == "nobooking":
+        q = q.filter(~User.id.in_(booked_users))
+    elif audience.startswith("lang:"):
+        lang = audience.split(":", 1)[1]
+        # Tilini tanlamagan eski mijozlar standart bo'yicha kirill hisoblanadi
+        q = q.filter(User.language == lang) if lang == "lt" else q.filter((User.language == lang) | User.language.is_(None))
+    elif audience.startswith("service:"):
+        try:
+            service_id = int(audience.split(":", 1)[1])
+        except ValueError:
+            service_id = -1
+        q = q.filter(User.id.in_(booked_users.filter(Booking.service_id == service_id)))
+    return q.distinct()
