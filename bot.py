@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.error import Forbidden, RetryAfter
 from flask import Flask
-from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from database import db, create_all_with_indexes, OperatorThread, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
 from common import (
     configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
     customer_status_text, STATUS_EMOJI, STATUS_LABEL,
@@ -283,6 +283,18 @@ TEXTS = {
     "review_thanks": {
         "lt": "✅ Rahmat! Sizning bahoyingiz: {stars}\n\nFikringiz biz uchun juda muhim. 🙏",
         "kr": "✅ Раҳмат! Сизнинг баҳойингиз: {stars}\n\nФикрингиз биз учун жуда муҳим. 🙏",
+    },
+    "operator_reply_header": {
+        "lt": "👨‍⚕️ <b>Operator javobi:</b>",
+        "kr": "👨‍⚕️ <b>Оператор жавоби:</b>",
+    },
+    "operator_reply_hint": {
+        "lt": "\n\n<i>Javob yozish uchun shu yerga xabar yuboring.</i>",
+        "kr": "\n\n<i>Жавоб ёзиш учун шу ерга хабар юборинг.</i>",
+    },
+    "sent_to_operator": {
+        "lt": "📨 Xabaringiz operatorga yuborildi.",
+        "kr": "📨 Хабарингиз операторга юборилди.",
     },
     "referral_btn": {"lt": "🎁 Do'stni taklif qilish", "kr": "🎁 Дўстни таклиф қилиш"},
     "referral_info": {
@@ -957,6 +969,47 @@ async def faq_view_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+# Operator mijozga javob yozgach, shu muddat ichida mijozning keyingi xabarlari FAQ avtojavobisiz
+# to'g'ridan-to'g'ri operatorlarga boradi (suhbat davom etishi uchun)
+OPERATOR_CHAT_WINDOW = timedelta(minutes=30)
+
+
+async def forward_to_operators(context: ContextTypes.DEFAULT_TYPE, tg_user, title: str, question_text: str) -> bool:
+    """Mijoz savolini admin guruhiga yuboradi va xabar qaysi mijozga tegishli ekanini bazaga yozadi —
+    operator shu xabarga REPLY qilsa, javob bot orqali mijozga yetkaziladi."""
+    display_name = context.user_data.get("name") or tg_user.first_name or "Foydalanuvchi"
+    username_line = f"@{esc(tg_user.username)}" if tg_user.username else "username yo'q"
+    try:
+        sent = await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            parse_mode="HTML",
+            text=(
+                f"{title}\n\n"
+                f"👤 Ism: {esc(display_name)}\n"
+                f"💬 Telegram: {username_line}\n"
+                f"🔗 Profil: {user_mention_html(tg_user, label=display_name)}\n"
+                f"🆔 ID: {tg_user.id}\n\n"
+                f"Savol: {esc(question_text)}\n\n"
+                f"↩️ <i>Mijozga javob berish uchun shu xabarga REPLY qiling</i>"
+            )
+        )
+    except Exception as e:
+        logger.error(f"Savolni operatorga yuborishda xato: {e}")
+        return False
+
+    with flask_app.app_context():
+        db.session.add(OperatorThread(
+            group_chat_id=sent.chat_id, group_message_id=sent.message_id, user_telegram_id=tg_user.id
+        ))
+        db.session.commit()
+    return True
+
+
+def in_operator_chat(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    until = context.user_data.get("operator_chat_until")
+    return bool(until and datetime.utcnow() < until)
+
+
 async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Erkin matnli savolga FAQ bazasidan avtomatik javob beradi (faqat conversation faol bo'lmaganda ishlaydi)."""
     question_text = (update.message.text or "").strip()
@@ -964,6 +1017,13 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     tg_user = update.effective_user
+    lang = get_lang(context)
+
+    # Operator bilan suhbat davom etyapti — xabar to'g'ridan-to'g'ri operatorlarga boradi
+    if in_operator_chat(context):
+        if await forward_to_operators(context, tg_user, "💬 <b>Mijoz javobi</b>", question_text):
+            await update.message.reply_text(t("sent_to_operator", lang))
+        return
 
     with flask_app.app_context():
         faqs = FAQ.query.all()
@@ -972,7 +1032,7 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if best_faq and score >= FAQ_MATCH_THRESHOLD:
         context.user_data["last_question"] = question_text
-        keyboard = [[InlineKeyboardButton("👨‍⚕️ Operatorga ulanish", callback_data="ask_operator")]]
+        keyboard = [[InlineKeyboardButton(t("faq_operator_btn", lang), callback_data="ask_operator")]]
         await update.message.reply_text(
             f"❓ <b>{esc(best_faq.question)}</b>\n" + SEP + f"\n💬 {esc(best_faq.answer)}",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -981,23 +1041,7 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # Mos javob topilmadi — savolni operatorlar guruhiga yuborish
-    display_name = context.user_data.get("name") or tg_user.first_name or "Foydalanuvchi"
-    username_line = f"@{esc(tg_user.username)}" if tg_user.username else "username yo'q"
-    try:
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            parse_mode="HTML",
-            text=(
-                f"❓ <b>Yangi savol</b> (avtomatik javob topilmadi)\n\n"
-                f"👤 Ism: {esc(display_name)}\n"
-                f"💬 Telegram: {username_line}\n"
-                f"🔗 Profil: {user_mention_html(tg_user, label=display_name)}\n"
-                f"🆔 ID: {tg_user.id}\n\n"
-                f"Savol: {esc(question_text)}"
-            )
-        )
-    except Exception as e:
-        logger.error(f"Savolni operatorga yuborishda xato: {e}")
+    await forward_to_operators(context, tg_user, "❓ <b>Yangi savol</b> (avtomatik javob topilmadi)", question_text)
 
     await update.message.reply_text(
         "🙏 <b>Savolingiz uchun rahmat!</b>\nOperatorlarimiz tez orada javob berishadi.\n\n"
@@ -1010,27 +1054,40 @@ async def ask_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """FAQ javobi yordam bermasa, savolni operatorlar guruhiga yuboradi."""
     query = update.callback_query
     await query.answer("Savolingiz operatorga yuborildi ✅", show_alert=True)
-
-    tg_user = update.effective_user
     question_text = context.user_data.get("last_question", "(mavjud emas)")
-    display_name = context.user_data.get("name") or tg_user.first_name or "Foydalanuvchi"
-    username_line = f"@{esc(tg_user.username)}" if tg_user.username else "username yo'q"
+    await forward_to_operators(
+        context, update.effective_user, "🙋 <b>Foydalanuvchi operator yordamini so'radi</b>", question_text
+    )
 
+
+async def deliver_operator_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_tg_id: int) -> None:
+    """Operatorning guruhdagi REPLY xabarini bot nomidan mijozga yetkazadi (matn, rasm, ovoz — istalgan tur)."""
+    msg = update.message
+    with flask_app.app_context():
+        user = User.query.filter_by(telegram_id=user_tg_id).first()
+        lang = (user.language if user else None) or "kr"
+
+    header = t("operator_reply_header", lang)
     try:
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            parse_mode="HTML",
-            text=(
-                f"🙋 <b>Foydalanuvchi operator yordamini so'radi</b>\n\n"
-                f"👤 Ism: {esc(display_name)}\n"
-                f"💬 Telegram: {username_line}\n"
-                f"🔗 Profil: {user_mention_html(tg_user, label=display_name)}\n"
-                f"🆔 ID: {tg_user.id}\n\n"
-                f"Savol: {esc(question_text)}"
+        if msg.text:
+            await context.bot.send_message(
+                chat_id=user_tg_id, parse_mode="HTML",
+                text=f"{header}\n\n{esc(msg.text)}{t('operator_reply_hint', lang)}",
             )
-        )
+        else:
+            await context.bot.send_message(chat_id=user_tg_id, text=header, parse_mode="HTML")
+            await context.bot.copy_message(chat_id=user_tg_id, from_chat_id=msg.chat_id, message_id=msg.message_id)
+    except Forbidden:
+        await msg.reply_text("❌ Yuborilmadi: mijoz botni bloklagan.")
+        return
     except Exception as e:
-        logger.error(f"Operatorga yuborishda xato: {e}")
+        logger.error(f"Operator javobini mijozga yuborishda xato: {e}")
+        await msg.reply_text("❌ Mijozga yuborib bo'lmadi.")
+        return
+
+    # Mijozning keyingi xabarlari FAQ'siz to'g'ridan-to'g'ri operatorlarga borsin
+    context.application.user_data[user_tg_id]["operator_chat_until"] = datetime.utcnow() + OPERATOR_CHAT_WINDOW
+    await msg.reply_text("✅ Mijozga yuborildi")
 
 
 # ==================== MENING BRONLARIM ====================
@@ -1390,15 +1447,33 @@ async def group_ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def group_date_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Guruhda ForceReply so'roviga berilgan javobni qabul qiladi. FAQAT bizning promptimizga
+    """Guruhdagi REPLY xabarlar: (1) "📅 Sana belgilash" so'roviga javob — sana saqlanadi;
+    (2) mijoz savoli yoki booking kartochkasiga javob — bot orqali mijozga yetkaziladi.
+    Guruhda ForceReply so'roviga berilgan javobni qabul qiladi. FAQAT bizning promptimizga
     JAVOB qilingan xabarlarga reaksiya beradi — boshqa har qanday guruh xabari e'tiborsiz
     qoldiriladi, shuning uchun avvalgi 'guruhda tasodifiy javob berish' muammosi qaytmaydi."""
     msg = update.message
     if not msg or not msg.reply_to_message:
         return
-    booking_id = PENDING_GROUP_DATE_REQUESTS.get(msg.reply_to_message.message_id)
+    replied = msg.reply_to_message
+    booking_id = PENDING_GROUP_DATE_REQUESTS.get(replied.message_id)
     if booking_id is None:
-        return  # bizning so'rovimizga javob emas
+        # Sana so'roviga emas — balki mijoz savoli yoki booking kartochkasiga javob bo'lsa, mijozga yetkazamiz
+        if not replied.from_user or replied.from_user.id != context.bot.id:
+            return
+        with flask_app.app_context():
+            thread = OperatorThread.query.filter_by(
+                group_chat_id=msg.chat_id, group_message_id=replied.message_id
+            ).first()
+            user_tg_id = thread.user_telegram_id if thread else None
+            if user_tg_id is None:
+                b = Booking.query.filter_by(group_chat_id=msg.chat_id, group_message_id=replied.message_id).first()
+                user_tg_id = b.user.telegram_id if b and b.user else None
+        if user_tg_id is not None:
+            await deliver_operator_reply(update, context, user_tg_id)
+        return
+    if not msg.text:
+        return
 
     text = (msg.text or "").strip()
     try:
@@ -1721,7 +1796,7 @@ async def run_bot():
     # Guruhdagi "✔️ Bajarildi" / "📅 Sana belgilash" tugmalari va sana javobini qabul qilish
     application.add_handler(CallbackQueryHandler(group_ask_date, pattern="^groupsetdate_"))
     application.add_handler(
-        MessageHandler(filters.Chat(chat_id=CHANNEL_ID) & filters.REPLY & filters.TEXT, group_date_reply)
+        MessageHandler(filters.Chat(chat_id=CHANNEL_ID) & filters.REPLY & ~filters.COMMAND, group_date_reply)
     )
     # Mening bronlarim
     application.add_handler(CallbackQueryHandler(show_my_bookings_list, pattern="^mybookings_list$"))
