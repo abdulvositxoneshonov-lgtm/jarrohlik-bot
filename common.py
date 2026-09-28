@@ -8,7 +8,7 @@ biri o'zgarsa, ikkinchisi eskirib qolardi. Endi ikkala bot ham shu yerdagi bitta
 import html
 import os
 import re
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
 
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
@@ -38,6 +38,77 @@ def local_now() -> datetime:
     if LOCAL_TZ is None:
         return datetime.now()
     return datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
+
+# ==================== ISH JADVALI (MIJOZ O'ZI VAQT TANLASHI UCHUN) ====================
+
+def _parse_hm(value: str, fallback: str) -> time:
+    try:
+        return datetime.strptime((value or fallback).strip(), "%H:%M").time()
+    except ValueError:
+        return datetime.strptime(fallback, "%H:%M").time()
+
+
+# ISO hafta kunlari: 1=Dushanba ... 7=Yakshanba (standart: Du–Sha)
+WORK_DAYS = {int(x) for x in os.getenv("WORK_DAYS", "1,2,3,4,5,6").split(",") if x.strip().isdigit()}
+WORK_START = _parse_hm(os.getenv("WORK_START"), "09:00")
+WORK_END = _parse_hm(os.getenv("WORK_END"), "18:00")
+SLOT_MINUTES = max(10, int(os.getenv("SLOT_MINUTES", "60") or 60))
+BOOKING_DAYS_AHEAD = max(1, int(os.getenv("BOOKING_DAYS_AHEAD", "7") or 7))
+MIN_LEAD_MINUTES = int(os.getenv("MIN_LEAD_MINUTES", "60") or 60)  # hozirdan kamida shuncha keyin
+SLOT_CAPACITY = max(1, int(os.getenv("SLOT_CAPACITY", "1") or 1))   # bitta xizmat uchun bir vaqtda nechta mijoz
+
+WEEKDAY_SHORT = {
+    "lt": ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"],
+    "kr": ["Ду", "Се", "Чо", "Па", "Жу", "Ша", "Як"],
+}
+
+
+def day_slots(d: date):
+    """Berilgan kunning barcha ish vaqti slotlari (bandligidan qat'i nazar)."""
+    if d.isoweekday() not in WORK_DAYS:
+        return []
+    slots = []
+    current = datetime.combine(d, WORK_START)
+    end = datetime.combine(d, WORK_END)
+    while current + timedelta(minutes=SLOT_MINUTES) <= end:
+        slots.append(current)
+        current += timedelta(minutes=SLOT_MINUTES)
+    return slots
+
+
+def busy_slot_counts(service_id: int, start: datetime, end: datetime) -> dict:
+    """[start, end) oralig'ida shu xizmat uchun band slotlar -> nechta bron. app_context ichida chaqiriladi."""
+    rows = db.session.query(Booking.appointment_at, db.func.count(Booking.id)).filter(
+        Booking.service_id == service_id,
+        Booking.status.in_([BookingStatus.PENDING, BookingStatus.CONFIRMED]),
+        Booking.appointment_at >= start,
+        Booking.appointment_at < end,
+    ).group_by(Booking.appointment_at).all()
+    return dict(rows)
+
+
+def free_slots(service_id: int, d: date):
+    """Shu kun uchun bo'sh (va hali o'tib ketmagan) slotlar. app_context ichida chaqiriladi."""
+    earliest = local_now() + timedelta(minutes=MIN_LEAD_MINUTES)
+    slots = [s for s in day_slots(d) if s >= earliest]
+    if not slots:
+        return []
+    busy = busy_slot_counts(service_id, datetime.combine(d, time.min), datetime.combine(d + timedelta(days=1), time.min))
+    return [s for s in slots if busy.get(s, 0) < SLOT_CAPACITY]
+
+
+def available_dates(service_id: int):
+    """Yaqin BOOKING_DAYS_AHEAD kun ichida kamida bitta bo'sh sloti bor kunlar. app_context ichida."""
+    today = local_now().date()
+    return [
+        today + timedelta(days=i) for i in range(BOOKING_DAYS_AHEAD + 1)
+        if free_slots(service_id, today + timedelta(days=i))
+    ]
+
+
+def is_slot_free(service_id: int, slot: datetime) -> bool:
+    return slot in free_slots(service_id, slot.date())
 
 
 # ==================== BAZA SOZLAMALARI ====================
@@ -146,8 +217,8 @@ def build_admin_card_keyboard(b: Booking):
 
 CUSTOMER_STATUS_TEXTS = {
     "confirmed": {
-        "lt": "✅ <b>Qabulingiz tasdiqlandi!</b>\n🏥 Xizmat: <b>{service}</b>\n\nOperator tez orada siz bilan bog'lanadi. 🙏",
-        "kr": "✅ <b>Қабулингиз тасдиқланди!</b>\n🏥 Хизмат: <b>{service}</b>\n\nОператор тез орада сиз билан боғланади. 🙏",
+        "lt": "✅ <b>Qabulingiz tasdiqlandi!</b>\n🏥 Xizmat: <b>{service}</b>{date_line}\n\nOperator tez orada siz bilan bog'lanadi. 🙏",
+        "kr": "✅ <b>Қабулингиз тасдиқланди!</b>\n🏥 Хизмат: <b>{service}</b>{date_line}\n\nОператор тез орада сиз билан боғланади. 🙏",
     },
     "cancelled": {
         "lt": "❌ Afsuski, «<b>{service}</b>» bo'yicha qabulingiz rad etildi. Operator siz bilan bog'lanadi.",
@@ -162,4 +233,8 @@ CUSTOMER_STATUS_TEXTS = {
 
 def customer_status_text(kind: str, lang: str, **kwargs) -> str:
     texts = CUSTOMER_STATUS_TEXTS[kind]
+    if kind == "confirmed":
+        appt = kwargs.pop("appointment_at", None)
+        label = "Сана" if lang == "kr" else "Sana"
+        kwargs["date_line"] = f"\n📅 {label}: <b>{appt.strftime('%d.%m.%Y %H:%M')}</b>" if appt else ""
     return texts.get(lang, texts["kr"]).format(**kwargs)

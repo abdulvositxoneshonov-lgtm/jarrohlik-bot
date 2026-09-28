@@ -30,6 +30,7 @@ from database import db, create_all_with_indexes, User, Service, Booking, FAQ, B
 from common import (
     configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
     customer_status_text, STATUS_EMOJI, STATUS_LABEL,
+    available_dates, free_slots, is_slot_free, WEEKDAY_SHORT,
 )
 
 # ==================== SOZLAMALAR ====================
@@ -66,7 +67,7 @@ if not SUBSCRIPTION_GATE_ENABLED:
     )
 
 # Conversation holatlari
-LANG, NAME, PHONE, SUBSCRIBE, MENU, CONFIRM = range(6)
+LANG, NAME, PHONE, SUBSCRIBE, MENU, CONFIRM, PICK_DATE, PICK_TIME = range(8)
 
 # broadcast_worker() fonda xabar yuborishi uchun Application obyektiga murojaat qiladi
 application_instance = None
@@ -149,9 +150,37 @@ TEXTS = {
         "kr": "👋 <b>Хуш келибсиз, {name}!</b>\n\n🏥 <b>Жарроҳлик Маркази</b> сизга қуйидаги хизматларни таклиф қилади.\n\nҚайси хизматга ёзилмоқчисиз? 👇",
     },
     "confirm_text": {
-        "lt": "📋 <b>Qabul ma'lumotlari</b>\n" + SEP + "\n👤 Ism: <b>{name}</b>\n📱 Telefon: <b>{phone}</b>\n🏥 Xizmat: <b>{service}</b>\n💰 Narxi: <b>{price} so'm</b>\n" + SEP + "\n📞 Operator tez orada siz bilan bog'lanib, aniq sana va vaqtni belgilaydi.\n\n✅ Barcha ma'lumotlar to'g'rimi?",
-        "kr": "📋 <b>Қабул маълумотлари</b>\n" + SEP + "\n👤 Исм: <b>{name}</b>\n📱 Телефон: <b>{phone}</b>\n🏥 Хизмат: <b>{service}</b>\n💰 Нархи: <b>{price} сўм</b>\n" + SEP + "\n📞 Оператор тез орада сиз билан боғланиб, аниқ сана ва вақтни белгилайди.\n\n✅ Барча маълумотлар тўғрими?",
+        "lt": "📋 <b>Qabul ma'lumotlari</b>\n" + SEP + "\n👤 Ism: <b>{name}</b>\n📱 Telefon: <b>{phone}</b>\n🏥 Xizmat: <b>{service}</b>\n💰 Narxi: <b>{price} so'm</b>\n{slot_line}\n" + SEP + "\n{note}\n\n✅ Barcha ma'lumotlar to'g'rimi?",
+        "kr": "📋 <b>Қабул маълумотлари</b>\n" + SEP + "\n👤 Исм: <b>{name}</b>\n📱 Телефон: <b>{phone}</b>\n🏥 Хизмат: <b>{service}</b>\n💰 Нархи: <b>{price} сўм</b>\n{slot_line}\n" + SEP + "\n{note}\n\n✅ Барча маълумотлар тўғрими?",
     },
+    "slot_line_chosen": {"lt": "🗓 Vaqt: <b>{date}</b>", "kr": "🗓 Вақт: <b>{date}</b>"},
+    "slot_line_operator": {"lt": "🗓 Vaqt: operator belgilaydi", "kr": "🗓 Вақт: оператор белгилайди"},
+    "note_chosen": {
+        "lt": "📞 Operator vaqtni tasdiqlagach, sizga xabar yuboramiz.",
+        "kr": "📞 Оператор вақтни тасдиқлагач, сизга хабар юборамиз.",
+    },
+    "note_operator": {
+        "lt": "📞 Operator tez orada siz bilan bog'lanib, aniq sana va vaqtni belgilaydi.",
+        "kr": "📞 Оператор тез орада сиз билан боғланиб, аниқ сана ва вақтни белгилайди.",
+    },
+    "choose_date": {
+        "lt": "📅 <b>{service}</b>\n\nQaysi kunga yozilmoqchisiz? 👇",
+        "kr": "📅 <b>{service}</b>\n\nҚайси кунга ёзилмоқчисиз? 👇",
+    },
+    "choose_time": {
+        "lt": "🕒 <b>{date}</b> — bo'sh vaqtlar:\n\nQulay vaqtni tanlang 👇",
+        "kr": "🕒 <b>{date}</b> — бўш вақтлар:\n\nҚулай вақтни танланг 👇",
+    },
+    "no_free_dates": {
+        "lt": "😔 Yaqin kunlarda bo'sh vaqt qolmadi. Operator siz bilan bog'lanib, vaqt belgilaydi.",
+        "kr": "😔 Яқин кунларда бўш вақт қолмади. Оператор сиз билан боғланиб, вақт белгилайди.",
+    },
+    "slot_taken": {
+        "lt": "Afsuski, bu vaqt hozirgina band bo'ldi. Boshqa vaqtni tanlang.",
+        "kr": "Афсуски, бу вақт ҳозиргина банд бўлди. Бошқа вақтни танланг.",
+    },
+    "operator_time_btn": {"lt": "🤝 Vaqtni operator belgilasin", "kr": "🤝 Вақтни оператор белгиласин"},
+    "other_day_btn": {"lt": "⬅️ Boshqa kun", "kr": "⬅️ Бошқа кун"},
     "confirm_btn": {"lt": "✅ Tasdiqlash", "kr": "✅ Тасдиқлаш"},
     "back_to_services": {"lt": "⬅️ Boshqa xizmat", "kr": "⬅️ Бошқа хизмат"},
     "booking_success": {
@@ -647,49 +676,167 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # "Yana xizmat tanlash" — saqlangan ism/telefondan foydalanib ro'yxatni qayta ko'rsatadi
         return await edit_service_menu(query, context)
 
-    # svc_<id> — xizmat tanlandi
+    # svc_<id> — xizmat tanlandi, endi mijoz o'zi kun tanlaydi
     service_id = int(query.data.split("_")[1])
     with flask_app.app_context():
+        if not db.session.get(Service, service_id):
+            await query.edit_message_text(t("no_services", lang))
+            return ConversationHandler.END
+    context.user_data["service_id"] = service_id
+    context.user_data.pop("slot", None)
+    return await show_date_picker(query, context)
+
+
+def format_day_label(d, lang: str) -> str:
+    return f"{WEEKDAY_SHORT.get(lang, WEEKDAY_SHORT['kr'])[d.weekday()]} {d.strftime('%d.%m')}"
+
+
+async def show_date_picker(query, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bo'sh sloti bor yaqin kunlarni tugma qilib ko'rsatadi."""
+    lang = get_lang(context)
+    service_id = context.user_data.get("service_id")
+    with flask_app.app_context():
         service = db.session.get(Service, service_id)
+        service_name = service.name if service else "?"
+        dates = available_dates(service_id)
+
+    if not dates:
+        # Bo'sh vaqt qolmagan — eski usulda, vaqtni operator belgilaydi
+        context.user_data["slot"] = None
+        return await show_confirm(query, context, note_key="no_free_dates")
+
+    buttons = [InlineKeyboardButton(format_day_label(d, lang), callback_data=f"date_{d:%Y%m%d}") for d in dates]
+    keyboard = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    keyboard.append([InlineKeyboardButton(t("operator_time_btn", lang), callback_data="date_skip")])
+    keyboard.append([InlineKeyboardButton(t("back_to_services", lang), callback_data="date_back")])
+    await query.edit_message_text(
+        t("choose_date", lang, service=esc(service_name)),
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML",
+    )
+    return PICK_DATE
+
+
+async def pick_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """PICK_DATE holati: kun tanlandi — shu kunning bo'sh vaqtlarini ko'rsatadi."""
+    query = update.callback_query
+    lang = get_lang(context)
+
+    if query.data == "date_back":
+        await query.answer()
+        return await edit_service_menu(query, context)
+    if query.data == "date_skip":
+        await query.answer()
+        context.user_data["slot"] = None
+        return await show_confirm(query, context)
+
+    try:
+        day = datetime.strptime(query.data[len("date_"):], "%Y%m%d").date()
+    except ValueError:
+        await query.answer()
+        return PICK_DATE
+    context.user_data["picked_day"] = day.isoformat()
+
+    with flask_app.app_context():
+        slots = free_slots(context.user_data.get("service_id"), day)
+    if not slots:
+        await query.answer(t("slot_taken", lang), show_alert=True)
+        return await show_date_picker(query, context)
+    await query.answer()
+
+    buttons = [InlineKeyboardButton(s.strftime("%H:%M"), callback_data=f"time_{s:%H%M}") for s in slots]
+    keyboard = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    keyboard.append([InlineKeyboardButton(t("other_day_btn", lang), callback_data="time_back")])
+    await query.edit_message_text(
+        t("choose_time", lang, date=format_day_label(day, lang)),
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML",
+    )
+    return PICK_TIME
+
+
+async def pick_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """PICK_TIME holati: vaqt tanlandi — tasdiqlash oynasiga o'tadi."""
+    query = update.callback_query
+    lang = get_lang(context)
+
+    if query.data == "time_back":
+        await query.answer()
+        return await show_date_picker(query, context)
+
+    try:
+        day = datetime.fromisoformat(context.user_data["picked_day"]).date()
+        slot = datetime.combine(day, datetime.strptime(query.data[len("time_"):], "%H%M").time())
+    except (KeyError, ValueError):
+        await query.answer()
+        return await show_date_picker(query, context)
+
+    with flask_app.app_context():
+        free = is_slot_free(context.user_data.get("service_id"), slot)
+    if not free:
+        await query.answer(t("slot_taken", lang), show_alert=True)
+        return await show_date_picker(query, context)
+    await query.answer()
+
+    context.user_data["slot"] = slot.isoformat()
+    return await show_confirm(query, context)
+
+
+def get_chosen_slot(context: ContextTypes.DEFAULT_TYPE):
+    raw = context.user_data.get("slot")
+    return datetime.fromisoformat(raw) if raw else None
+
+
+async def show_confirm(query, context: ContextTypes.DEFAULT_TYPE, note_key: str = None) -> int:
+    """Yakuniy tasdiqlash oynasi (xizmat, narx, tanlangan vaqt)."""
+    lang = get_lang(context)
+    slot = get_chosen_slot(context)
+    with flask_app.app_context():
+        service = db.session.get(Service, context.user_data.get("service_id"))
         if not service:
             await query.edit_message_text(t("no_services", lang))
             return ConversationHandler.END
-
-        context.user_data["service_id"] = service_id
         text = t(
             "confirm_text", lang,
             name=esc(context.user_data.get("name")),
             phone=esc(context.user_data.get("phone")),
             service=esc(service.name),
-            duration=service.duration_minutes,
             price=f"{service.price:,.0f}",
+            slot_line=(t("slot_line_chosen", lang, date=f"{format_day_label(slot.date(), lang)} {slot:%H:%M}")
+                       if slot else t("slot_line_operator", lang)),
+            note=t(note_key or ("note_chosen" if slot else "note_operator"), lang),
         )
 
     keyboard = [
         [InlineKeyboardButton(t("confirm_btn", lang), callback_data="confirm")],
-        [InlineKeyboardButton(t("back_to_services", lang), callback_data="back")],
+        [InlineKeyboardButton(t("other_day_btn", lang), callback_data="back")],
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return CONFIRM
 
 
 async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """CONFIRM holati: tasdiqlash yoki xizmatlar ro'yxatiga qaytish."""
+    """CONFIRM holati: tasdiqlash yoki kun tanlashga qaytish."""
     query = update.callback_query
-    await query.answer()
     lang = get_lang(context)
 
     if query.data == "back":
-        return await edit_service_menu(query, context)
+        await query.answer()
+        return await show_date_picker(query, context)
 
-    # query.data == "confirm"
     tg_user = update.effective_user
+    service_id = context.user_data.get("service_id")
+    slot = get_chosen_slot(context)
     with flask_app.app_context():
+        # Mijoz tasdiqlaguncha boshqa odam shu vaqtni band qilgan bo'lishi mumkin — qayta tekshiramiz
+        if slot and not is_slot_free(service_id, slot):
+            await query.answer(t("slot_taken", lang), show_alert=True)
+            return await show_date_picker(query, context)
+
         db_user = User.query.filter_by(telegram_id=tg_user.id).first()
         booking = Booking(
             user_id=db_user.id,
-            service_id=context.user_data.get("service_id"),
+            service_id=service_id,
             status=BookingStatus.PENDING,
+            appointment_at=slot,
         )
         db.session.add(booking)
         db.session.commit()
@@ -698,6 +845,8 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         admin_message = build_admin_card_text(booking)
         admin_keyboard = build_admin_card_keyboard(booking)
 
+    await query.answer()
+    context.user_data.pop("slot", None)
     try:
         sent_msg = await context.bot.send_message(
             chat_id=CHANNEL_ID, text=admin_message, parse_mode="HTML",
@@ -1199,6 +1348,7 @@ async def group_change_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_tg_id = booking.user.telegram_id
         user_lang = booking.user.language or "kr"
         service_name = booking.service.name if booking.service else "?"
+        appointment_at = booking.appointment_at
 
     await query.answer("✅ Yangilandi")
 
@@ -1206,7 +1356,7 @@ async def group_change_status(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await context.bot.send_message(
                 chat_id=user_tg_id,
-                text=customer_status_text(notify_kind, user_lang, service=esc(service_name)),
+                text=customer_status_text(notify_kind, user_lang, service=esc(service_name), appointment_at=appointment_at),
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -1551,6 +1701,8 @@ async def run_bot():
             PHONE: [MessageHandler((filters.TEXT | filters.CONTACT) & ~filters.COMMAND, get_phone)],
             SUBSCRIBE: [CallbackQueryHandler(verify_subscription, pattern="^check_subscription$")],
             MENU: [CallbackQueryHandler(select_service, pattern="^svc_")],
+            PICK_DATE: [CallbackQueryHandler(pick_date, pattern="^date_")],
+            PICK_TIME: [CallbackQueryHandler(pick_time, pattern="^time_")],
             CONFIRM: [CallbackQueryHandler(confirm_booking, pattern="^(confirm|back)$")],
         },
         fallbacks=[

@@ -150,6 +150,8 @@ async def notify_customer(booking_id: int, kind: str, **extra) -> None:
         chat_id = b.user.telegram_id
         lang = b.user.language or "kr"
         service = html.escape(b.service.name if b.service else "?")
+        if kind == "confirmed":
+            extra.setdefault("appointment_at", b.appointment_at)
     try:
         await customer_bot.send_message(
             chat_id=chat_id, text=customer_status_text(kind, lang, service=service, **extra), parse_mode="HTML"
