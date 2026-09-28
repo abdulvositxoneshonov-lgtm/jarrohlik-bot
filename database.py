@@ -2,7 +2,7 @@ from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from enum import Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, Float, DateTime, Text, Enum as SQLEnum, ForeignKey, Index, Boolean
+from sqlalchemy import String, Integer, BigInteger, Float, DateTime, Text, Enum as SQLEnum, ForeignKey, Index, Boolean
 
 db = SQLAlchemy()
 
@@ -20,7 +20,7 @@ class User(db.Model):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False, index=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False, index=True)  # Telegram ID 2^31 dan katta bo'lishi mumkin
     username: Mapped[str] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=True)  # Botga o'zi kiritgan ism
@@ -29,7 +29,7 @@ class User(db.Model):
     profile_pic_url: Mapped[str] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     referral_code: Mapped[str] = mapped_column(String(20), unique=True, nullable=True)  # Bu foydalanuvchining o'ziga xos taklif kodi
-    referred_by_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)  # Kimning taklifi bilan kelgan (users.id)
+    referred_by_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True, index=True)  # Kimning taklifi bilan kelgan (users.id)
 
     # Relationships
     bookings = relationship("Booking", back_populates="user", cascade="all, delete-orphan")
@@ -110,11 +110,17 @@ class Booking(db.Model):
     review_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # Sharh so'rovi yuborilganmi
     # Admin guruhiga yuborilgan bildirishnoma kartochkasining joylashuvi — booking holati ADMIN BOTDA
     # o'zgartirilganda ham, aynan shu kartochkani (guruhdagi) real vaqtda yangilash uchun ishlatiladi
-    group_chat_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    group_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     group_message_id: Mapped[int] = mapped_column(Integer, nullable=True)
     # Booking uzoq vaqt "Kutilmoqda" holatida javobsiz qolib ketsa, operatorlarga bitta marta
     # ogohlantirish eslatmasi yuborilganini belgilaydi (takror spam bo'lmasligi uchun)
     followup_reminder_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Eslatmalar workeri har 5 daqiqada status + sana bo'yicha qidiradi
+    __table_args__ = (
+        Index("idx_booking_status_appointment", "status", "appointment_at"),
+        Index("idx_booking_status_created", "status", "created_at"),
+    )
 
     # Relationships
     user = relationship("User", back_populates="bookings")
@@ -248,11 +254,11 @@ class BroadcastMessage(db.Model):
         return f"<BroadcastMessage {self.id} - {self.status}>"
 
 
-# Create indexes for better query performance
-__table_args__ = (
-    Index("idx_user_telegram_id", User.telegram_id),
-    Index("idx_service_name", Service.name),
-    Index("idx_booking_user_id", Booking.user_id),
-    Index("idx_booking_service_id", Booking.service_id),
-    Index("idx_faq_category", FAQ.category),
-)
+def create_all_with_indexes():
+    """db.create_all() mavjud jadvallarga YANGI indekslarni qo'shmaydi — shuning uchun eski
+    bazalarda ham indekslar paydo bo'lishi uchun ularni alohida (checkfirst bilan) yaratamiz.
+    FAQAT app_context ichida chaqiriladi."""
+    db.create_all()
+    for table in db.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(bind=db.engine, checkfirst=True)

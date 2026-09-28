@@ -13,7 +13,6 @@ import asyncio
 import io
 import uuid
 import html
-from collections import Counter
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
@@ -27,7 +26,9 @@ from telegram.ext import (
     filters,
 )
 from flask import Flask
-from database import db, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from sqlalchemy import func
+from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from common import configure_db, local_now, build_admin_card_text, build_admin_card_keyboard, customer_status_text
 
 # ==================== SOZLAMALAR ====================
 
@@ -102,68 +103,16 @@ SVC_FIELDS = {
 
 # Bot.py bilan BIR XIL bazaga ulanadi
 flask_app = Flask(__name__)
-flask_app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
-flask_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db.init_app(flask_app)
+configure_db(flask_app, DATABASE_URL)
 
 with flask_app.app_context():
-    db.create_all()
+    create_all_with_indexes()
 
 
 # ==================== YORDAMCHI FUNKSIYALAR ====================
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-
-def build_group_card_text(b: Booking) -> str:
-    """bot.py'dagi build_admin_card_text() bilan BIR XIL formatni takrorlaydi — chunki bu
-    kartochkani QAYSI bot tahrirlashidan qat'iy nazar (bot.py yoki shu admin_bot.py), u bir xil
-    ko'rinishda qolishi kerak. FAQAT flask_app.app_context() ichida chaqiriladi."""
-    username_line = f"@{html.escape(b.user.username)}" if b.user.username else "username yo'q"
-    referral_line = ""
-    if b.user.referred_by_id:
-        referrer = User.query.get(b.user.referred_by_id)
-        if referrer:
-            referrer_label = html.escape(str(referrer.full_name or referrer.first_name or referrer.telegram_id))
-            referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
-    display_name = html.escape(b.user.full_name or b.user.first_name or "Foydalanuvchi")
-    text = (
-        f"{STATUS_EMOJI.get(b.status, '⚪')} <b>Qabul Talabi — {STATUS_LABEL.get(b.status, b.status.value)}</b>\n\n"
-        f"👤 Ism: {display_name}\n"
-        f"📱 Telefon: {html.escape(b.user.phone or '—')}\n"
-        f"💬 Telegram: {username_line}\n"
-        f"🔗 Profil: <a href=\"tg://user?id={b.user.telegram_id}\">{display_name}</a>\n"
-        f"{referral_line}"
-        f"🏥 Xizmat: {html.escape(b.service.name if b.service else '?')}\n"
-        f"💰 Narxi: {b.service.price:,.0f} so'm\n"
-    )
-    if b.appointment_at:
-        text += f"🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
-    if b.rating:
-        text += f"⭐ Mijoz bahosi: {'⭐' * b.rating}\n"
-    text += f"\nID: {b.id}\nYaratilgan: {b.created_at.strftime('%Y-%m-%d %H:%M')}"
-    return text
-
-
-def build_group_card_keyboard(b: Booking):
-    """bot.py'dagi build_admin_card_keyboard() bilan bir xil — o'chirish tugmasi bu yerda YO'Q."""
-    rows = []
-    top_row = []
-    if b.status != BookingStatus.CONFIRMED:
-        top_row.append(InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{b.id}"))
-    if b.status != BookingStatus.CANCELLED:
-        top_row.append(InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{b.id}"))
-    if top_row:
-        rows.append(top_row)
-    bottom_row = []
-    if b.status != BookingStatus.COMPLETED:
-        bottom_row.append(InlineKeyboardButton("✔️ Bajarildi", callback_data=f"groupdone_{b.id}"))
-    if b.status == BookingStatus.CONFIRMED:
-        bottom_row.append(InlineKeyboardButton("📅 Sana belgilash", callback_data=f"groupsetdate_{b.id}"))
-    if bottom_row:
-        rows.append(bottom_row)
-    return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def sync_group_card(booking_id: int) -> None:
@@ -174,11 +123,11 @@ async def sync_group_card(booking_id: int) -> None:
         logger.warning("TELEGRAM_BOT_TOKEN .env'da yo'q — guruh kartochkasini sinxronlab bo'lmadi.")
         return
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b or not b.group_chat_id or not b.group_message_id:
             return
-        text = build_group_card_text(b)
-        keyboard = build_group_card_keyboard(b)
+        text = build_admin_card_text(b)
+        keyboard = build_admin_card_keyboard(b)
         g_chat_id, g_msg_id = b.group_chat_id, b.group_message_id
     try:
         await customer_bot.edit_message_text(
@@ -187,6 +136,26 @@ async def sync_group_card(booking_id: int) -> None:
         )
     except Exception as e:
         logger.warning(f"Guruh kartochkasini sinxronlashda xato (booking {booking_id}): {e}")
+
+
+async def notify_customer(booking_id: int, kind: str, **extra) -> None:
+    """Admin botda booking holati/sanasi o'zgarganda mijozga MIJOZLAR BOTI orqali (uning tilida)
+    xabar yuboradi — admin bot mijoz bilan suhbat ochmagani uchun o'zi yozolmaydi."""
+    if not customer_bot:
+        return
+    with flask_app.app_context():
+        b = db.session.get(Booking, booking_id)
+        if not b or not b.user:
+            return
+        chat_id = b.user.telegram_id
+        lang = b.user.language or "kr"
+        service = html.escape(b.service.name if b.service else "?")
+    try:
+        await customer_bot.send_message(
+            chat_id=chat_id, text=customer_status_text(kind, lang, service=service, **extra), parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"Mijozga xabar yuborilmadi (booking {booking_id}): {e}")
 
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
@@ -330,7 +299,7 @@ async def show_bookings_list(query, context: ContextTypes.DEFAULT_TYPE, filter_k
 async def show_booking_detail(query, context: ContextTypes.DEFAULT_TYPE, booking_id: int) -> int:
     """Bitta booking haqida to'liq, chiroyli formatlangan karta — status o'zgartirish va o'chirish tugmalari bilan."""
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b:
             await query.answer("Booking topilmadi!", show_alert=True)
             return await show_bookings_filter_menu(query, context)
@@ -380,16 +349,20 @@ async def show_booking_detail(query, context: ContextTypes.DEFAULT_TYPE, booking
 
 
 async def change_booking_status(query, context: ContextTypes.DEFAULT_TYPE, new_status_value: str, booking_id: int) -> int:
-    """Booking statusini admin panel ichidan o'zgartiradi (mijozga avtomatik xabar bormaydi — buni faqat mijozlar boti qila oladi)."""
+    """Booking statusini admin panel ichidan o'zgartiradi va mijozga (mijozlar boti orqali) xabar beradi."""
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b:
             await query.answer("Booking topilmadi!", show_alert=True)
             return await show_bookings_filter_menu(query, context)
-        b.status = BookingStatus(new_status_value)
+        new_status = BookingStatus(new_status_value)
+        changed = b.status != new_status
+        b.status = new_status
         db.session.commit()
 
     await sync_group_card(booking_id)
+    if changed and new_status_value in ("confirmed", "cancelled"):
+        await notify_customer(booking_id, new_status_value)
     await query.answer("✅ Status yangilandi!", show_alert=False)
     return await show_booking_detail(query, context, booking_id)
 
@@ -419,10 +392,12 @@ async def appointment_date_received(update: Update, context: ContextTypes.DEFAUL
 
     try:
         appointment_at = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        if appointment_at <= local_now():
+            raise ValueError("o'tgan sana")
     except ValueError:
         keyboard = [[InlineKeyboardButton("⬅️ Bekor qilish", callback_data=f"bk_view_{booking_id}")]]
         await update.message.reply_text(
-            "Format noto'g'ri. Iltimos, aynan shu ko'rinishda yozing:\n"
+            "Format noto'g'ri yoki sana o'tib ketgan. Iltimos, aynan shu ko'rinishda yozing:\n"
             "<code>25.12.2026 14:30</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -430,7 +405,7 @@ async def appointment_date_received(update: Update, context: ContextTypes.DEFAUL
         return APPOINTMENT_DATE
 
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b:
             await update.message.reply_text("Booking topilmadi.")
             return ADMIN_MENU
@@ -441,6 +416,7 @@ async def appointment_date_received(update: Update, context: ContextTypes.DEFAUL
         db.session.commit()
 
     await sync_group_card(booking_id)
+    await notify_customer(booking_id, "appointment", date=appointment_at.strftime("%d.%m.%Y %H:%M"))
 
     keyboard = [[InlineKeyboardButton("⬅️ Bookingga qaytish", callback_data=f"bk_view_{booking_id}")]]
     await update.message.reply_text(
@@ -455,7 +431,7 @@ async def appointment_date_received(update: Update, context: ContextTypes.DEFAUL
 async def confirm_booking_delete(query, context: ContextTypes.DEFAULT_TYPE, booking_id: int) -> int:
     """Bitta bookingni o'chirishdan oldin tasdiqlash so'raydi."""
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b:
             await query.answer("Booking topilmadi!", show_alert=True)
             return await show_bookings_filter_menu(query, context)
@@ -477,7 +453,7 @@ async def delete_booking(query, context: ContextTypes.DEFAULT_TYPE, booking_id: 
     """Bitta bookingni bazadan butunlay o'chiradi."""
     group_chat_id = group_message_id = None
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if b:
             group_chat_id, group_message_id = b.group_chat_id, b.group_message_id
             db.session.delete(b)
@@ -860,28 +836,36 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             week_ago = datetime.utcnow() - timedelta(days=7)
             week_bookings = Booking.query.filter(Booking.created_at >= week_ago).count()
 
-            pending_c = Booking.query.filter_by(status=BookingStatus.PENDING).count()
-            confirmed_c = Booking.query.filter_by(status=BookingStatus.CONFIRMED).count()
-            cancelled_c = Booking.query.filter_by(status=BookingStatus.CANCELLED).count()
-            completed_c = Booking.query.filter_by(status=BookingStatus.COMPLETED).count()
+            # Barcha hisob-kitoblar bazaning o'zida (GROUP BY / SUM / AVG) — butun jadvallarni
+            # xotiraga yuklamasdan, mijozlar soni o'sganda ham tez ishlaydi
+            status_counts = dict(
+                db.session.query(Booking.status, func.count(Booking.id)).group_by(Booking.status).all()
+            )
+            pending_c = status_counts.get(BookingStatus.PENDING, 0)
+            confirmed_c = status_counts.get(BookingStatus.CONFIRMED, 0)
+            cancelled_c = status_counts.get(BookingStatus.CANCELLED, 0)
+            completed_c = status_counts.get(BookingStatus.COMPLETED, 0)
 
             # Taxminiy daromad — tasdiqlangan va bajarilgan bookinglar narxlari yig'indisi
-            revenue_bookings = Booking.query.filter(
+            revenue = db.session.query(func.coalesce(func.sum(Service.price), 0)).select_from(Booking).join(
+                Service, Booking.service_id == Service.id
+            ).filter(
                 Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.COMPLETED])
-            ).all()
-            revenue = sum((b.service.price if b.service else 0) for b in revenue_bookings)
+            ).scalar()
 
             # O'rtacha mijoz bahosi (sharh so'rovi orqali yig'ilgan)
-            rated = Booking.query.filter(Booking.rating.isnot(None)).all()
-            avg_rating = (sum(b.rating for b in rated) / len(rated)) if rated else None
+            avg_rating, rated_count = db.session.query(
+                func.avg(Booking.rating), func.count(Booking.rating)
+            ).filter(Booking.rating.isnot(None)).one()
 
             # Eng faol taklif qiluvchi (referral tizimi orqali eng ko'p do'st jalb qilgan mijoz)
-            referred_users = User.query.filter(User.referred_by_id.isnot(None)).all()
+            top_row = db.session.query(User.referred_by_id, func.count(User.id).label("c")).filter(
+                User.referred_by_id.isnot(None)
+            ).group_by(User.referred_by_id).order_by(func.count(User.id).desc()).first()
             top_referrer_line = ""
-            if referred_users:
-                counts = Counter(u.referred_by_id for u in referred_users)
-                top_id, top_count = counts.most_common(1)[0]
-                top_user = User.query.get(top_id)
+            if top_row:
+                top_id, top_count = top_row
+                top_user = db.session.get(User, top_id)
                 top_name = html.escape(top_user.full_name or top_user.first_name or "?") if top_user else "?"
                 top_referrer_line = f"\n🏆 Eng faol taklif qiluvchi: <b>{top_name}</b> ({top_count} ta do'st)"
 
@@ -889,7 +873,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             faq_count = FAQ.query.count()
 
         rating_line = (
-            f"⭐ O'rtacha baho: <b>{avg_rating:.1f}/5</b> ({len(rated)} ta sharh)"
+            f"⭐ O'rtacha baho: <b>{avg_rating:.1f}/5</b> ({rated_count} ta sharh)"
             if avg_rating is not None else "⭐ Hali sharhlar yo'q"
         )
 
@@ -1018,7 +1002,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if data.startswith("asvc_delconfirm_"):
         service_id = int(data.rsplit("_", 1)[1])
         with flask_app.app_context():
-            service = Service.query.get(service_id)
+            service = db.session.get(Service, service_id)
             if service:
                 db.session.delete(service)
                 db.session.commit()
@@ -1028,7 +1012,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if data.startswith("asvc_delete_"):
         service_id = int(data.rsplit("_", 1)[1])
         with flask_app.app_context():
-            service = Service.query.get(service_id)
+            service = db.session.get(Service, service_id)
             name = service.name if service else "?"
         keyboard = [
             [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"asvc_delconfirm_{service_id}")],
@@ -1044,7 +1028,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if data.startswith("faq_delete_confirm_"):
         faq_id = int(data.rsplit("_", 1)[1])
         with flask_app.app_context():
-            faq = FAQ.query.get(faq_id)
+            faq = db.session.get(FAQ, faq_id)
             if faq:
                 db.session.delete(faq)
                 db.session.commit()
@@ -1054,7 +1038,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if data.startswith("faq_delete_"):
         faq_id = int(data.rsplit("_", 1)[1])
         with flask_app.app_context():
-            faq = FAQ.query.get(faq_id)
+            faq = db.session.get(FAQ, faq_id)
             question = faq.question if faq else "?"
         keyboard = [
             [InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"faq_delete_confirm_{faq_id}")],
@@ -1117,7 +1101,7 @@ async def svc_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     value = update.message.text.strip()
 
     with flask_app.app_context():
-        service = Service.query.get(service_id)
+        service = db.session.get(Service, service_id)
         if not service:
             await update.message.reply_text("Xizmat topilmadi.")
             return ADMIN_MENU

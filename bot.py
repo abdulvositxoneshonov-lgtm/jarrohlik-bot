@@ -24,8 +24,13 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import Forbidden, RetryAfter
 from flask import Flask
-from database import db, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from database import db, create_all_with_indexes, User, Service, Booking, FAQ, BookingStatus, QuickLink, ClinicInfo, BroadcastMessage
+from common import (
+    configure_db, local_now, normalize_phone, build_admin_card_text, build_admin_card_keyboard,
+    customer_status_text, STATUS_EMOJI, STATUS_LABEL,
+)
 
 # ==================== SOZLAMALAR ====================
 
@@ -82,12 +87,10 @@ SERVICES_DATA = [
 ]
 
 flask_app = Flask(__name__)
-flask_app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
-flask_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db.init_app(flask_app)
+configure_db(flask_app, DATABASE_URL)
 
 with flask_app.app_context():
-    db.create_all()
+    create_all_with_indexes()
     if Service.query.count() == 0:
         for s in SERVICES_DATA:
             db.session.add(Service(
@@ -116,6 +119,14 @@ TEXTS = {
     "ask_phone": {
         "lt": "Rahmat, <b>{name}</b>! 😊\n\n📱 Endi telefon raqamingizni pastdagi tugma orqali ulashing yoki yozib yuboring:",
         "kr": "Рахмат, <b>{name}</b>! 😊\n\n📱 Энди телефон рақамингизни пастдаги тугма орқали улашинг ёки ёзиб юборинг:",
+    },
+    "invalid_name": {
+        "lt": "⚠️ Iltimos, ismingizni to'g'ri kiriting (2–64 ta belgi):",
+        "kr": "⚠️ Илтимос, исмингизни тўғри киритинг (2–64 та белги):",
+    },
+    "invalid_phone": {
+        "lt": "⚠️ Telefon raqam noto'g'ri. Pastdagi tugma orqali ulashing yoki shunday yozing: <code>+998901234567</code>",
+        "kr": "⚠️ Телефон рақам нотўғри. Пастдаги тугма орқали улашинг ёки шундай ёзинг: <code>+998901234567</code>",
     },
     "share_contact_btn": {
         "lt": "📱 Kontaktni ulashish",
@@ -276,62 +287,6 @@ def user_mention_html(tg_user, label: str = None) -> str:
     """Foydalanuvchi profiliga bosiladigan HTML havola — username bo'lmasa ham ID orqali ochiladi."""
     name = esc(label or tg_user.first_name or "Foydalanuvchi")
     return f'<a href="tg://user?id={tg_user.id}">{name}</a>'
-
-
-GROUP_STATUS_EMOJI = {"pending": "🟡", "confirmed": "🟢", "cancelled": "🔴", "completed": "✅"}
-GROUP_STATUS_LABEL = {"pending": "Kutilmoqda", "confirmed": "Tasdiqlangan", "cancelled": "Bekor qilingan", "completed": "Bajarilgan"}
-
-
-def build_admin_card_text(b: Booking) -> str:
-    """Admin GURUHIGA yuboriladigan bildirishnoma kartochkasi matnini booking obyektidan yasaydi.
-    Bu funksiya booking holati QAYERDA o'zgarishidan qat'iy nazar (guruhning o'zida yoki admin
-    botda) chaqiriladi — shunday qilib karta HAR DOIM haqiqiy holatni ko'rsatadi.
-    FAQAT flask_app.app_context() ICHIDA, b.user va b.service yuklangan holatda chaqirilishi kerak."""
-    username_line = f"@{esc(b.user.username)}" if b.user.username else "username yo'q"
-    referral_line = ""
-    if b.user.referred_by_id:
-        referrer = User.query.get(b.user.referred_by_id)
-        if referrer:
-            referrer_label = esc(referrer.full_name or referrer.first_name or referrer.telegram_id)
-            referral_line = f"🎁 Taklif orqali: {referrer_label}\n"
-    display_name = esc(b.user.full_name or b.user.first_name or "Foydalanuvchi")
-    text = (
-        f"{GROUP_STATUS_EMOJI.get(b.status.value, '⚪')} <b>Qabul Talabi — {GROUP_STATUS_LABEL.get(b.status.value, b.status.value)}</b>\n\n"
-        f"👤 Ism: {display_name}\n"
-        f"📱 Telefon: {esc(b.user.phone or '—')}\n"
-        f"💬 Telegram: {username_line}\n"
-        f"🔗 Profil: <a href=\"tg://user?id={b.user.telegram_id}\">{display_name}</a>\n"
-        f"{referral_line}"
-        f"🏥 Xizmat: {esc(b.service.name if b.service else '?')}\n"
-        f"💰 Narxi: {b.service.price:,.0f} so'm\n"
-    )
-    if b.appointment_at:
-        text += f"🗓 Qabul vaqti: <b>{b.appointment_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
-    if b.rating:
-        text += f"⭐ Mijoz bahosi: {'⭐' * b.rating}\n"
-    text += f"\nID: {b.id}\nYaratilgan: {b.created_at.strftime('%Y-%m-%d %H:%M')}"
-    return text
-
-
-def build_admin_card_keyboard(b: Booking):
-    """Booking holatiga qarab admin GURUHIDAGI kartochka tugmalarini yasaydi — o'chirish
-    tugmasi ataylab BU YERDA yo'q (o'chirish faqat admin botda, tasdiqlash bilan)."""
-    rows = []
-    top_row = []
-    if b.status != BookingStatus.CONFIRMED:
-        top_row.append(InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"approve_{b.id}"))
-    if b.status != BookingStatus.CANCELLED:
-        top_row.append(InlineKeyboardButton("❌ Rad etish", callback_data=f"reject_{b.id}"))
-    if top_row:
-        rows.append(top_row)
-    bottom_row = []
-    if b.status != BookingStatus.COMPLETED:
-        bottom_row.append(InlineKeyboardButton("✔️ Bajarildi", callback_data=f"groupdone_{b.id}"))
-    if b.status == BookingStatus.CONFIRMED:
-        bottom_row.append(InlineKeyboardButton("📅 Sana belgilash", callback_data=f"groupsetdate_{b.id}"))
-    if bottom_row:
-        rows.append(bottom_row)
-    return InlineKeyboardMarkup(rows) if rows else None
 
 
 def generate_unique_referral_code() -> str:
@@ -586,7 +541,10 @@ async def select_language(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ismni qabul qiladi va kontakt ulashish tugmasini chiqaradi."""
     lang = get_lang(context)
-    name = update.message.text.strip()
+    name = " ".join(update.message.text.split())
+    if not (2 <= len(name) <= 64):
+        await update.message.reply_text(t("invalid_name", lang), parse_mode="HTML")
+        return NAME
     context.user_data["name"] = name
 
     keyboard = [
@@ -606,15 +564,21 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = get_lang(context)
 
     if update.message.contact:
-        phone = update.message.contact.phone_number
-        if not phone.startswith("+"):
-            phone = "+" + phone
+        contact = update.message.contact
+        # Boshqa odamning kontaktini yuborib, uning nomidan ro'yxatdan o'tishning oldini olamiz
+        if contact.user_id and contact.user_id != update.effective_user.id:
+            await update.message.reply_text(t("invalid_phone", lang), parse_mode="HTML")
+            return PHONE
+        phone = normalize_phone(contact.phone_number) or contact.phone_number
     else:
         text = update.message.text.strip()
         if text == t("cancel_btn", lang):
             await update.message.reply_text(t("cancelled", lang), reply_markup=ReplyKeyboardRemove())
             return ConversationHandler.END
-        phone = text
+        phone = normalize_phone(text)
+        if not phone:
+            await update.message.reply_text(t("invalid_phone", lang), parse_mode="HTML")
+            return PHONE
 
     context.user_data["phone"] = phone
     tg_user = update.effective_user
@@ -640,7 +604,7 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         db.session.commit()
 
         if is_first_registration and db_user.referred_by_id:
-            referrer = User.query.get(db_user.referred_by_id)
+            referrer = db.session.get(User, db_user.referred_by_id)
             if referrer:
                 notify_referrer = (referrer.telegram_id, referrer.language or "kr")
 
@@ -686,7 +650,7 @@ async def select_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # svc_<id> — xizmat tanlandi
     service_id = int(query.data.split("_")[1])
     with flask_app.app_context():
-        service = Service.query.get(service_id)
+        service = db.session.get(Service, service_id)
         if not service:
             await query.edit_message_text(t("no_services", lang))
             return ConversationHandler.END
@@ -742,7 +706,7 @@ async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Kartochka joylashuvini saqlaymiz — shu orqali booking holati admin BOTDA
         # o'zgartirilganda ham, aynan shu guruh xabari real vaqtda yangilanadi
         with flask_app.app_context():
-            b = Booking.query.get(booking_id)
+            b = db.session.get(Booking, booking_id)
             b.group_chat_id = sent_msg.chat_id
             b.group_message_id = sent_msg.message_id
             db.session.commit()
@@ -826,7 +790,7 @@ async def faq_view_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     faq_id = int(data.rsplit("_", 1)[1])
     with flask_app.app_context():
-        faq = FAQ.query.get(faq_id)
+        faq = db.session.get(FAQ, faq_id)
 
     if not faq:
         await query.edit_message_text(t("faq_not_found", lang))
@@ -925,7 +889,7 @@ async def ask_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def build_my_bookings_keyboard(bookings, lang: str) -> InlineKeyboardMarkup:
     keyboard = []
     for b in bookings:
-        emoji = {"pending": "🟡", "confirmed": "🟢", "cancelled": "🔴", "completed": "✅"}.get(b.status.value, "⚪")
+        emoji = STATUS_EMOJI.get(b.status.value, "⚪")
         svc = b.service.name if b.service else "?"
         date_str = b.created_at.strftime("%d.%m.%Y") if b.created_at else ""
         btn_text = f"{emoji} {svc} · {date_str}"
@@ -969,11 +933,8 @@ async def show_my_booking_detail(update: Update, context: ContextTypes.DEFAULT_T
     tg_user = update.effective_user
     booking_id = int(query.data.rsplit("_", 1)[1])
 
-    status_labels = {"pending": "Kutilmoqda", "confirmed": "Tasdiqlangan", "cancelled": "Bekor qilingan", "completed": "Bajarilgan"}
-    status_emoji = {"pending": "🟡", "confirmed": "🟢", "cancelled": "🔴", "completed": "✅"}
-
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         # XAVFSIZLIK: faqat o'z bronini ko'rishi mumkin
         if not b or b.user.telegram_id != tg_user.id:
             await query.answer("Bron topilmadi.", show_alert=True)
@@ -982,8 +943,8 @@ async def show_my_booking_detail(update: Update, context: ContextTypes.DEFAULT_T
         text = t(
             "my_booking_detail", lang,
             id=b.id,
-            emoji=status_emoji.get(b.status.value, "⚪"),
-            status=status_labels.get(b.status.value, b.status.value),
+            emoji=STATUS_EMOJI.get(b.status.value, "⚪"),
+            status=STATUS_LABEL.get(b.status.value, b.status.value),
             service=esc(b.service.name if b.service else "?"),
             price=f"{b.service.price:,.0f}" if b.service else "?",
             date=b.created_at.strftime("%d.%m.%Y %H:%M") if b.created_at else "",
@@ -1011,7 +972,7 @@ async def confirm_my_booking_cancel(update: Update, context: ContextTypes.DEFAUL
     booking_id = int(query.data.rsplit("_", 1)[1])
 
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b or b.user.telegram_id != tg_user.id:
             await query.answer("Bron topilmadi.", show_alert=True)
             return
@@ -1036,14 +997,19 @@ async def do_my_booking_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     booking_id = int(query.data.rsplit("_", 1)[1])
 
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b or b.user.telegram_id != tg_user.id:
             await query.answer("Bron topilmadi.", show_alert=True)
+            return
+        if b.status not in (BookingStatus.PENDING, BookingStatus.CONFIRMED):
+            await query.answer("Bu bronni bekor qilib bo'lmaydi.", show_alert=True)
             return
         b.status = BookingStatus.CANCELLED
         db.session.commit()
         svc_name = b.service.name if b.service else "?"
         display_name = context.user_data.get("name") or tg_user.first_name or "Foydalanuvchi"
+        card_text, card_keyboard = build_admin_card_text(b), build_admin_card_keyboard(b)
+        g_chat_id, g_msg_id = b.group_chat_id, b.group_message_id
 
     await query.answer()
     await query.edit_message_text(t("my_booking_cancelled", lang))
@@ -1061,6 +1027,8 @@ async def do_my_booking_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         logger.error(f"Bekor qilish haqida adminga xabar berishda xato: {e}")
+
+    await edit_group_card(context.bot, g_chat_id, g_msg_id, card_text, card_keyboard)
 
 
 async def back_to_menu_from_mybookings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1160,9 +1128,11 @@ async def rate_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         booking_id, stars = int(booking_id_str), int(stars_str)
     except (ValueError, IndexError):
         return
+    if not 1 <= stars <= 5:
+        return
 
     with flask_app.app_context():
-        b = Booking.query.get(booking_id)
+        b = db.session.get(Booking, booking_id)
         if not b or b.user.telegram_id != tg_user.id:
             await query.answer("Bron topilmadi.", show_alert=True)
             return
@@ -1172,84 +1142,89 @@ async def rate_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.edit_message_text(t("review_thanks", lang, stars="⭐" * stars), parse_mode="HTML")
 
 
-async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+def is_admin_group(chat) -> bool:
+    """Guruh kartochkasi tugmalari FAQAT admin guruhida ishlashi kerak — boshqa joydan kelgan
+    (masalan, soxtalashtirilgan) callback'lar bilan booking holatini o'zgartirib bo'lmasin."""
+    return chat is not None and chat.id == CHANNEL_ID
+
+
+async def edit_group_card(bot, chat_id, message_id, text, keyboard) -> None:
+    """Guruhdagi booking kartochkasini yangilaydi (joylashuvi saqlanmagan bo'lsa — jim o'tadi)."""
+    if not chat_id or not message_id:
+        return
     try:
-        booking_id = int(query.data.split("_")[1])
-        with flask_app.app_context():
-            booking = Booking.query.get(booking_id)
-            if booking:
-                booking.status = BookingStatus.CONFIRMED
-                db.session.commit()
-                try:
-                    await context.bot.send_message(
-                        chat_id=booking.user.telegram_id,
-                        text="✅ Qabulingiz tasdiqlandi!\n\nOperator sizni tez orada chaqirib yuboradi. 🙏"
-                    )
-                except Exception as e:
-                    logger.error(f"Foydalanuvchini xabardor qilishda xato: {e}")
-                await query.edit_message_text(
-                    build_admin_card_text(booking), parse_mode="HTML",
-                    reply_markup=build_admin_card_keyboard(booking)
-                )
-            else:
-                await query.answer("Qabul topilmadi!", show_alert=True)
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text,
+            parse_mode="HTML", reply_markup=keyboard
+        )
     except Exception as e:
-        logger.error(f"Tasdiqlashda xato: {e}")
+        logger.warning(f"Guruh kartochkasini yangilashda xato: {e}")
 
 
-async def admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# callback prefiksi -> (yangi holat, mijozga yuboriladigan xabar turi yoki None)
+GROUP_STATUS_ACTIONS = {
+    "approve": (BookingStatus.CONFIRMED, "confirmed"),
+    "reject": (BookingStatus.CANCELLED, "cancelled"),
+    "groupdone": (BookingStatus.COMPLETED, None),  # sharh so'rovini eslatma workeri yuboradi
+}
+
+
+async def group_change_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Guruhdagi ✅ Tasdiqlash / ❌ Rad etish / ✔️ Bajarildi tugmalari."""
     query = update.callback_query
-    await query.answer()
-    try:
-        booking_id = int(query.data.split("_")[1])
-        with flask_app.app_context():
-            booking = Booking.query.get(booking_id)
-            if booking:
-                booking.status = BookingStatus.CANCELLED
-                db.session.commit()
-                try:
-                    await context.bot.send_message(
-                        chat_id=booking.user.telegram_id,
-                        text="❌ Afsuski, qabulingiz rad etildi. Operator siz bilan bog'lanadi."
-                    )
-                except Exception as e:
-                    logger.error(f"Foydalanuvchini xabardor qilishda xato: {e}")
-                await query.edit_message_text(
-                    build_admin_card_text(booking), parse_mode="HTML",
-                    reply_markup=build_admin_card_keyboard(booking)
-                )
-            else:
-                await query.answer("Qabul topilmadi!", show_alert=True)
-    except Exception as e:
-        logger.error(f"Rad etishda xato: {e}")
+    if not is_admin_group(query.message.chat if query.message else None):
+        await query.answer("⛔ Ruxsat yo'q", show_alert=True)
+        return
 
-
-async def group_mark_completed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Guruhdagi '✔️ Bajarildi' tugmasi — bookingni Bajarilgan deb belgilaydi va kartani yangilaydi."""
-    query = update.callback_query
-    await query.answer()
     try:
-        booking_id = int(query.data.rsplit("_", 1)[1])
-        with flask_app.app_context():
-            booking = Booking.query.get(booking_id)
-            if not booking:
-                await query.answer("Booking topilmadi!", show_alert=True)
-                return
-            booking.status = BookingStatus.COMPLETED
-            db.session.commit()
-            text = build_admin_card_text(booking)
-            keyboard = build_admin_card_keyboard(booking)
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        action, booking_id_str = query.data.rsplit("_", 1)
+        new_status, notify_kind = GROUP_STATUS_ACTIONS[action]
+        booking_id = int(booking_id_str)
+    except (ValueError, KeyError):
+        await query.answer()
+        return
+
+    with flask_app.app_context():
+        booking = db.session.get(Booking, booking_id)
+        if not booking:
+            await query.answer("Qabul topilmadi!", show_alert=True)
+            return
+        if booking.status == new_status:
+            await query.answer("Holat allaqachon shunday.")
+            return
+        booking.status = new_status
+        db.session.commit()
+        card_text = build_admin_card_text(booking)
+        card_keyboard = build_admin_card_keyboard(booking)
+        user_tg_id = booking.user.telegram_id
+        user_lang = booking.user.language or "kr"
+        service_name = booking.service.name if booking.service else "?"
+
+    await query.answer("✅ Yangilandi")
+
+    if notify_kind:
+        try:
+            await context.bot.send_message(
+                chat_id=user_tg_id,
+                text=customer_status_text(notify_kind, user_lang, service=esc(service_name)),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Foydalanuvchini xabardor qilishda xato: {e}")
+
+    try:
+        await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=card_keyboard)
     except Exception as e:
-        logger.error(f"Guruhda 'Bajarildi' belgilashda xato: {e}")
+        logger.warning(f"Guruh kartochkasini yangilashda xato (booking {booking_id}): {e}")
 
 
 async def group_ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Guruhdagi '📅 Sana belgilash' tugmasi — ForceReply orqali sana so'raydi.
     Operator FAQAT shu xabarga javob qilib yozgandagina bot amal qiladi (pastdagi group_date_reply)."""
     query = update.callback_query
+    if not is_admin_group(query.message.chat if query.message else None):
+        await query.answer("⛔ Ruxsat yo'q", show_alert=True)
+        return
     await query.answer()
     booking_id = int(query.data.rsplit("_", 1)[1])
     prompt = await context.bot.send_message(
@@ -1278,15 +1253,17 @@ async def group_date_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = (msg.text or "").strip()
     try:
         appointment_at = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        if appointment_at <= local_now():
+            raise ValueError("o'tgan sana")
     except ValueError:
         await msg.reply_text(
-            "Format noto'g'ri. Masalan: 25.12.2026 14:30 — qaytadan '📅 Sana belgilash' tugmasini bosing."
+            "Format noto'g'ri yoki sana o'tib ketgan. Masalan: 25.12.2026 14:30 — qaytadan '📅 Sana belgilash' tugmasini bosing."
         )
         del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
         return
 
     with flask_app.app_context():
-        booking = Booking.query.get(booking_id)
+        booking = db.session.get(Booking, booking_id)
         if not booking:
             await msg.reply_text("Booking topilmadi.")
             del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
@@ -1299,18 +1276,24 @@ async def group_date_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         card_text = build_admin_card_text(booking)
         card_keyboard = build_admin_card_keyboard(booking)
         g_chat_id, g_msg_id = booking.group_chat_id, booking.group_message_id
+        user_tg_id = booking.user.telegram_id
+        user_lang = booking.user.language or "kr"
+        service_name = booking.service.name if booking.service else "?"
 
     del PENDING_GROUP_DATE_REQUESTS[msg.reply_to_message.message_id]
-    await msg.reply_text(f"✅ Qabul sanasi belgilandi: {appointment_at.strftime('%d.%m.%Y %H:%M')}")
+    date_str = appointment_at.strftime('%d.%m.%Y %H:%M')
+    await msg.reply_text(f"✅ Qabul sanasi belgilandi: {date_str}")
 
-    if g_chat_id and g_msg_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=g_chat_id, message_id=g_msg_id, text=card_text,
-                parse_mode="HTML", reply_markup=card_keyboard
-            )
-        except Exception as e:
-            logger.warning(f"Guruh kartochkasini yangilashda xato: {e}")
+    await edit_group_card(context.bot, g_chat_id, g_msg_id, card_text, card_keyboard)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_tg_id,
+            text=customer_status_text("appointment", user_lang, service=esc(service_name), date=date_str),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"Mijozga qabul sanasi haqida xabar berilmadi (booking {booking_id}): {e}")
 
 
 # ==================== OMMAVIY XABAR (BROADCAST) ====================
@@ -1335,8 +1318,10 @@ async def broadcast_worker():
                 image_path = None
                 telegram_ids = []
                 if pending:
-                    users = User.query.filter(User.full_name.isnot(None), User.phone.isnot(None)).all()
-                    telegram_ids = [u.telegram_id for u in users]
+                    telegram_ids = [
+                        tg_id for (tg_id,) in db.session.query(User.telegram_id)
+                        .filter(User.full_name.isnot(None), User.phone.isnot(None))
+                    ]
                     pending.status = "sending"
                     pending.total_count = len(telegram_ids)
                     db.session.commit()
@@ -1354,28 +1339,48 @@ async def broadcast_worker():
                 elif image_path:
                     logger.warning(f"Broadcast #{broadcast_id}: rasm fayli topilmadi ({image_path})")
 
+                bot = application_instance.bot
+                photo_ref = image_bytes  # birinchi muvaffaqiyatli yuborishdan keyin file_id bilan almashtiriladi
+
+                async def send_one(tg_id):
+                    nonlocal photo_ref
+                    if photo_ref:
+                        if len(caption) <= 1024:
+                            msg = await bot.send_photo(chat_id=tg_id, photo=photo_ref, caption=caption, parse_mode="HTML")
+                        else:
+                            # Caption 1024 belgidan uzun — rasm alohida, matn alohida yuboriladi
+                            msg = await bot.send_photo(chat_id=tg_id, photo=photo_ref)
+                            await bot.send_message(chat_id=tg_id, text=caption, parse_mode="HTML")
+                        # Rasmni har bir mijozga qayta yuklamaslik uchun — shu botning file_id'sini qayta ishlatamiz
+                        if isinstance(photo_ref, bytes) and msg.photo:
+                            photo_ref = msg.photo[-1].file_id
+                    else:
+                        await bot.send_message(chat_id=tg_id, text=caption, parse_mode="HTML")
+
                 sent, failed = 0, 0
                 for tg_id in telegram_ids:
-                    try:
-                        if image_bytes:
-                            if len(caption) <= 1024:
-                                await application_instance.bot.send_photo(
-                                    chat_id=tg_id, photo=image_bytes, caption=caption, parse_mode="HTML"
-                                )
-                            else:
-                                # Caption 1024 belgidan uzun — rasm alohida, matn alohida yuboriladi
-                                await application_instance.bot.send_photo(chat_id=tg_id, photo=image_bytes)
-                                await application_instance.bot.send_message(chat_id=tg_id, text=caption, parse_mode="HTML")
-                        else:
-                            await application_instance.bot.send_message(chat_id=tg_id, text=caption, parse_mode="HTML")
-                        sent += 1
-                    except Exception as e:
+                    for attempt in range(3):
+                        try:
+                            await send_one(tg_id)
+                            sent += 1
+                            break
+                        except RetryAfter as e:
+                            # Telegram flood-limit: aytilgan vaqtcha kutib, qayta urinamiz
+                            wait = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else e.retry_after
+                            await asyncio.sleep(float(wait) + 1)
+                        except Forbidden:
+                            failed += 1  # mijoz botni bloklagan — qayta urinish befoyda
+                            break
+                        except Exception as e:
+                            failed += 1
+                            logger.warning(f"Broadcast yuborilmadi (user {tg_id}): {e}")
+                            break
+                    else:
                         failed += 1
-                        logger.warning(f"Broadcast yuborilmadi (user {tg_id}): {e}")
-                    await asyncio.sleep(0.05)  # Telegram flood-limitidan saqlanish uchun
+                    await asyncio.sleep(0.05)  # Telegram flood-limitidan saqlanish uchun (~20 xabar/soniya)
 
                 with flask_app.app_context():
-                    bm = BroadcastMessage.query.get(broadcast_id)
+                    bm = db.session.get(BroadcastMessage, broadcast_id)
                     if bm:
                         bm.status = "done"
                         bm.sent_count = sent
@@ -1401,7 +1406,9 @@ async def reminder_and_review_worker():
     qabullardan keyin mijozdan sharh (baho) so'rovini yuboradi."""
     while True:
         try:
-            now = datetime.utcnow()
+            # appointment_at operator tomonidan MAHALLIY vaqtda kiritiladi, created_at esa UTC'da saqlanadi
+            now = local_now()
+            now_utc = datetime.utcnow()
             with flask_app.app_context():
                 # --- 24 soat qolgan eslatmalar ---
                 due_24h = Booking.query.filter(
@@ -1456,7 +1463,7 @@ async def reminder_and_review_worker():
                 # hech kimga bildirishnoma yubormaydi, shuning uchun bu ataylab YANGI xabar sifatida
                 # yuboriladi. Har bir booking uchun FAQAT BIR MARTA (followup_reminder_sent orqali
                 # nazorat qilinadi — spam bo'lmasligi uchun).
-                stale_cutoff = now - timedelta(minutes=30)
+                stale_cutoff = now_utc - timedelta(minutes=30)
                 due_followup = Booking.query.filter(
                     Booking.status == BookingStatus.PENDING,
                     Booking.created_at <= stale_cutoff,
@@ -1557,11 +1564,9 @@ async def run_bot():
     application.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("faq", faq_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CallbackQueryHandler(faq_view_answer, pattern="^faqview_"))
-    application.add_handler(CallbackQueryHandler(admin_approve, pattern="^approve_"))
-    application.add_handler(CallbackQueryHandler(admin_reject, pattern="^reject_"))
+    application.add_handler(CallbackQueryHandler(group_change_status, pattern=r"^(approve|reject|groupdone)_\d+$"))
     application.add_handler(CallbackQueryHandler(ask_operator, pattern="^ask_operator$"))
     # Guruhdagi "✔️ Bajarildi" / "📅 Sana belgilash" tugmalari va sana javobini qabul qilish
-    application.add_handler(CallbackQueryHandler(group_mark_completed, pattern="^groupdone_"))
     application.add_handler(CallbackQueryHandler(group_ask_date, pattern="^groupsetdate_"))
     application.add_handler(
         MessageHandler(filters.Chat(chat_id=CHANNEL_ID) & filters.REPLY & filters.TEXT, group_date_reply)

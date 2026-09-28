@@ -8,7 +8,9 @@ Tibbiy markaz uchun Telegram bot + Flask admin panel. Foydalanuvchilar botda xiz
 jarrohlik-bot/
 ├── bot.py               # Telegram bot (python-telegram-bot 20.1, polling)
 ├── app.py                # Flask API + admin panel
-├── database.py           # SQLAlchemy modellar (User, Service, Booking, FAQ)
+├── admin_bot.py          # Admin boti (xizmatlar, FAQ, bookinglar, statistika, broadcast)
+├── common.py             # Ikkala bot uchun umumiy kod (guruh kartochkasi, vaqt zonasi, telefon tekshiruvi, SQLite sozlamalari)
+├── database.py           # SQLAlchemy modellar (User, Service, Booking, FAQ, ...)
 ├── seed_database.py       # Bazani boshlang'ich ma'lumotlar bilan to'ldirish
 ├── requirements.txt
 ├── .env.example
@@ -206,6 +208,9 @@ Bazani hali seed qilmagansiz yoki jadvallar yaratilmagan. `python seed_database.
 - Bot `CHANNEL_ID` bilan ko'rsatilgan guruhga qo'shilganini tekshiring
 - Guruh ID manfiy son bo'lishi kerak (masalan `-5127216730`); superguruh bo'lsa ID odatda `-100` bilan boshlanadi
 - Botga guruhda xabar yuborish huquqi (admin yoki oddiy a'zo, guruh sozlamalariga qarab) berilganini tekshiring
+
+**Eslatmalar noto'g'ri vaqtda kelyapti**
+Operator kiritgan qabul vaqti `.env` dagi `TIMEZONE` (standart: `Asia/Tashkent`) bo'yicha talqin qilinadi. Serveringiz boshqa zonada bo'lsa ham shu qiymat to'g'ri turganini tekshiring.
 
 **`instance/bot.db` topilmayapti yoki eski ma'lumotlar ko'rinyapti**
 Flask-SQLAlchemy nisbiy `sqlite:///bot.db` yo'lini ishga tushirilgan joydan qat'i nazar `instance/` papkasiga joylaydi. Bazani butunlay tozalash uchun `instance/` papkasini o'chirib, `python seed_database.py` ni qayta ishga tushiring.
